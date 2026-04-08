@@ -1,0 +1,17 @@
+Quickly | -Dquickly=true
+Run FE build goal | -Dskip.fe.build=false
+Skip FE build goal | -Dskip.fe.build=true
+Skip all tests | -DskipTests=true
+Skip all checks | -DskipChecks=true
+Skip unit tests | -DskipUTs=true
+Skip IT tests | -DskipITs=true
+Skip style check | -Dcheckstyle.skip=true
+Skip revapi check | -Drevapi.skip=true
+Skip license check | -license.skip=true
+Skip enforcer check | -Denforcer.skip=true
+Skip mdep check | -Dmdep.analyze.skip=true
+Skip sort check | -Dsort.skip=true
+Skip spotless check | -Dspotless.checks.skip=true
+Skip spottless apply | -Dspotless.apply.skip=true
+Skip flatten goal | -Dflatten.skip=true
+Skip assembly goal | -Dassembly.skipAssembly=true

@@ -1,0 +1,34 @@
+# Secrets and credentials
+*.local
+.env
+.env.*
+.npmrc
+.netrc
+.git-credentials
+
+# SSH private keys
+id_rsa
+id_ed25519
+id_ecdsa
+*.pem
+
+# OS noise
+.DS_Store
+Thumbs.db
+
+# Backup files
+*.bak
+*.swp
+*.swo
+*~
+.dotfiles-backup/
+
+# Editor noise
+.idea/
+*.code-workspace
+
+# Neovim generated
+nvim/lazy-lock.json
+
+# Caches
+.cache/
