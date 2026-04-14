@@ -7,21 +7,19 @@
 	lowSpeedLimit = 0
 	lowSpeedTime = 999999
 [alias]
-	# Conventional commit helper: _cc <type> [args...]
-	# Usage: git feat -s api "add user endpoint"
-	_cc = "!f() {\nlocal _type=\"$1\"; shift\nlocal _scope _attention _message\nwhile [ $# -ne 0 ]; do\ncase $1 in\n  -s | --scope )\n    if [ -z \"$2\" ]; then\n      echo \"Missing scope!\"\n      return 1\n    fi\n    _scope=\"$2\"\n    shift 2\n    ;;\n  -a | --attention )\n    _attention=\"!\"\n    shift 1\n    ;;\n  * )\n    _message=\"${_message} $1\"\n    shift 1\n    ;;\nesac\ndone\ngit commit -m \"${_type}${_scope:+(${_scope})}${_attention}:${_message}\"\n}; f"
-	build    = "!git _cc build"
-	chore    = "!git _cc chore"
-	ci       = "!git _cc ci"
-	docs     = "!git _cc docs"
-	feat     = "!git _cc feat"
-	fix      = "!git _cc fix"
-	perf     = "!git _cc perf"
-	refactor = "!git _cc refactor"
-	rev      = "!git _cc revert"
-	style    = "!git _cc style"
-	test     = "!git _cc test"
-	wip      = "!git _cc wip"
+	cc       = "!f() {\nlocal _type=\"$1\"; shift\nlocal _scope _attention _message\nwhile [ $# -ne 0 ]; do\ncase $1 in\n  -s | --scope )\n    if [ -z \"$2\" ]; then\n      echo \"Missing scope!\"\n      return 1\n    fi\n    _scope=\"$2\"\n    shift 2\n    ;;\n  -a | --attention )\n    _attention=\"!\"\n    shift 1\n    ;;\n  * )\n    _message=\"${_message} $1\"\n    shift 1\n    ;;\nesac\ndone\ngit commit -m \"${_type}${_scope:+(${_scope})}${_attention}:${_message}\"\n}; f"
+	build    = "!git cc build"
+	chore    = "!git cc chore"
+	ci       = "!git cc ci"
+	docs     = "!git cc docs"
+	feat     = "!git cc feat"
+	fix      = "!git cc fix"
+	perf     = "!git cc perf"
+	refactor = "!git cc refactor"
+	rev      = "!git cc revert"
+	style    = "!git cc style"
+	test     = "!git cc test"
+	wip      = "!git cc wip"
 [filter "lfs"]
 	required = true
 	clean = git-lfs clean -- %f

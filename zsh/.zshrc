@@ -43,6 +43,7 @@ alias l='ls -l'
 alias la='ls -a'
 alias lla='ls -la'
 alias c=clear
+alias m='micro'
 alias wrapon='tput rmam'
 alias wrapoff='tput smam'
 

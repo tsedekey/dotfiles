@@ -24,6 +24,10 @@
   "editor.formatOnSaveMode": "modificationsIfAvailable",
   "files.autoSave": "onFocusChange",
   "git.autoRepositoryDetection": "subFolders",
+  "redhat.telemetry.enabled": true,
+  "terminal.integrated.env.osx": {
+    "Q_NEW_SESSION": "1"
+  },
   "workbench.editor.historyBasedLanguageDetection": false,
   "workbench.iconTheme": "catppuccin-mocha",
   "github.copilot.nextEditSuggestions.enabled": true,

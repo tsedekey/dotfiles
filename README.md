@@ -100,12 +100,17 @@ Example `~/.gitconfig.local`:
 # Install everything from the Brewfile
 brew bundle --file=~/dotfiles/Brewfile
 
+# On work machines, layer work-only packages from a local Brewfile
+brew bundle --file=~/.Brewfile.local
+
 # Check what's missing
 brew bundle check --file=~/dotfiles/Brewfile
 
 # Update the Brewfile from current machine state
 brew bundle dump --file=~/dotfiles/Brewfile --force
 ```
+
+For profiles that need extra packages beyond the shared baseline, keep the repo `Brewfile` as the source of truth and add a local-only overlay file such as `~/.Brewfile.local`. Run both `brew bundle` commands on the work profile; run only the shared one on personal machines.
 
 ## Manual post-install steps
 
@@ -126,5 +131,5 @@ brew bundle dump --file=~/dotfiles/Brewfile --force
 - **zoxide** provides smart `cd` via the `z` command
 - **bat** is used as the MANPAGER for colorized man pages
 - **fzf** uses **fd** as its default command for fast, `.gitignore`-aware file finding
-- Conventional commit aliases (`git feat`, `git fix`, etc.) use a shared `_cc` helper to avoid duplication
+- Conventional commit aliases (`git feat`, `git fix`, etc.) use a shared `cc` helper to avoid duplication
 - Work-specific functions (Maven `mci`, `kibana` helper) are not included -- add them to `~/.zshrc.local` if needed
