@@ -10,6 +10,7 @@ Personal macOS developer environment configuration. Extracted from a live setup 
 | `git/` | `.gitconfig` with conventional commit aliases (feat, fix, chore, etc. via `_cc` helper), micro editor, git-delta pager, LFS, pull rebase |
 | `tmux/` | `.tmux.conf` with Catppuccin Mocha theme, Ctrl-a prefix, TPM, resurrect, continuum |
 | `lsd/` | `config.yaml` for the `lsd` ls replacement (icons, git column, header) |
+| `aichat/` | `config.yaml` for `aichat` (Anthropic Claude client, model definitions, `max_tokens` defaults) |
 | `vscode/` | `settings.json` (Catppuccin theme, Prettier, format-on-save), `keybindings.json` |
 | `gh/` | GitHub CLI config (https protocol, `co` alias) |
 | `maven/` | `.mvn-flags.list` (flag definitions for Maven workflows) |
@@ -111,6 +112,33 @@ brew bundle dump --file=~/dotfiles/Brewfile --force
 ```
 
 For profiles that need extra packages beyond the shared baseline, keep the repo `Brewfile` as the source of truth and add a local-only overlay file such as `~/.Brewfile.local`. Run both `brew bundle` commands on the work profile; run only the shared one on personal machines.
+
+## aichat
+
+AI-powered CLI for explaining, generating, and running shell commands. Configured for Anthropic Claude (Opus 4.7, Sonnet 4.6, Haiku 4.5); default is Sonnet 4.6.
+
+**Setup:** export your Anthropic API key as `CLAUDE_API_KEY` in `~/.zshrc.local` (aichat's claude client reads this variable, not `ANTHROPIC_API_KEY`):
+
+```bash
+export CLAUDE_API_KEY="sk-ant-api03-..."
+```
+
+**Usage:**
+
+```bash
+aichat "explain 'find . -type f -mtime -1'"           # ask a question
+aichat -e "list branches merged into main"            # -e: generate+run a shell command
+aichat -c "regex to match semver tags"                # -c: code-only output
+aichat -m claude:claude-opus-4-7 "design a ..."       # pick a different model
+aichat -f ./file.ts "review this for bugs"            # attach a file
+aichat                                                # start a REPL session
+```
+
+**Notes:**
+
+- Config at `~/Library/Application Support/aichat/config.yaml` (symlinked by installer).
+- `require_max_tokens: true` is set per model because Anthropic rejects requests without `max_tokens`.
+- No API key lives in the config file — only in `~/.zshrc.local` so nothing sensitive is committed.
 
 ## Manual post-install steps
 

@@ -1,5 +1,6 @@
 tap "anomalyco/tap"
 tap "jesseduffield/lazygit"
+brew "aichat"
 brew "asdf"
 brew "bash"
 brew "gettext"

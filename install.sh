@@ -74,6 +74,11 @@ info "LSD configuration"
 link_file "$DOTFILES_DIR/lsd/config.yaml"      "$HOME/.config/lsd/config.yaml"
 echo ""
 
+# --- aichat ---
+info "aichat configuration"
+link_file "$DOTFILES_DIR/aichat/config.yaml"   "$HOME/Library/Application Support/aichat/config.yaml"
+echo ""
+
 # --- VS Code ---
 info "VS Code configuration"
 VSCODE_USER_DIR="$HOME/Library/Application Support/Code/User"
