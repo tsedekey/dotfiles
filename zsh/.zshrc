@@ -1,4 +1,15 @@
 # ------------------------------------------------------------
+# Homebrew (ensure HOMEBREW_PREFIX is set for non-login shells)
+# ------------------------------------------------------------
+if [ -z "$HOMEBREW_PREFIX" ]; then
+  if [[ "$(uname -m)" == "arm64" ]]; then
+    eval "$(/opt/homebrew/bin/brew shellenv)"
+  else
+    eval "$(/usr/local/bin/brew shellenv)"
+  fi
+fi
+
+# ------------------------------------------------------------
 # Tmux auto-launch (attach to main or create it)
 # ------------------------------------------------------------
 if command -v tmux &>/dev/null && [ -z "$TMUX" ]; then
