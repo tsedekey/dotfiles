@@ -1,33 +1,29 @@
 # dotfiles
 
-Personal macOS developer environment configuration. Extracted from a live setup and sanitized for portability.
+Personal macOS developer environment configuration. Extracted from a live setup and sanitized for portability. Supports both Apple Silicon and Intel Macs.
 
 ## What's included
 
 | Directory | Contents |
 |---|---|
-| `zsh/` | `.zshrc` (tmux auto-launch, completion, history, aliases, fzf+fd, zoxide, vcs_info prompt), `.zprofile` (Homebrew init) |
+| `zsh/` | `.zshrc` (tmux auto-launch, completion, history, aliases, fzf+fd, zoxide, vcs_info prompt), `.zprofile` (Homebrew init, auto-detects Apple Silicon vs Intel) |
 | `git/` | `.gitconfig` with conventional commit aliases (feat, fix, chore, etc. via `_cc` helper), micro editor, git-delta pager, LFS, pull rebase |
 | `tmux/` | `.tmux.conf` with Catppuccin Mocha theme, Ctrl-a prefix, TPM, resurrect, continuum |
 | `lsd/` | `config.yaml` for the `lsd` ls replacement (icons, git column, header) |
-| `aichat/` | `config.yaml` for `aichat` (Anthropic Claude client, model definitions, `max_tokens` defaults) |
-| `vscode/` | `settings.json` (Catppuccin theme, Prettier, format-on-save), `keybindings.json` |
 | `gh/` | GitHub CLI config (https protocol, `co` alias) |
 | `maven/` | `.mvn-flags.list` (flag definitions for Maven workflows) |
 | `asdf/` | `.tool-versions` (node version) |
-| `Brewfile` | Full Homebrew package manifest (taps, formulae, casks, VS Code extensions) |
+| `Brewfile` | Cross-machine Homebrew baseline (taps, formulae) |
 
 ## Key tools
 
 - **Shell**: zsh (no frameworks) with autosuggestions + syntax highlighting
 - **Terminal editor**: micro
-- **GUI editor**: VS Code
 - **Terminal multiplexer**: tmux (Catppuccin Mocha, Ctrl-a prefix, session restore via resurrect+continuum)
 - **Git pager**: delta (side-by-side, line numbers)
 - **File navigation**: fzf + fd, zoxide (`z` for smart cd)
 - **Man pages**: bat as MANPAGER
-- **Container tools**: Docker, lazydocker, k9s, kubectl, helm, kind, minikube
-- **Theme**: Catppuccin Mocha across tmux and VS Code
+- **Theme**: Catppuccin Mocha across tmux
 
 ## What's excluded
 
@@ -40,9 +36,7 @@ Personal macOS developer environment configuration. Extracted from a live setup 
 | `~/.ssh/known_hosts` | Machine-specific |
 | `~/.config/starship.toml` | Not actively used; excluded by choice |
 | `~/.config/iterm2/` | Auto-managed by iTerm2 |
-| `~/.config/opencode/` | Minimal default config |
 | `~/.config/gcloud/` | Machine-specific cloud state |
-| `~/.config/pgcli/` | Default config + query history |
 | `~/.docker/` | Docker Desktop managed state |
 | `~/.nvm/`, `~/.colima/` | Tool installations, not config |
 | `~/.local/bin/` | Contains third-party binaries |
@@ -50,10 +44,12 @@ Personal macOS developer environment configuration. Extracted from a live setup 
 
 ## Bootstrap a new macOS profile
 
+Works on both Apple Silicon and Intel — `.zprofile` detects the architecture automatically.
+
 ```bash
 # 1. Install Homebrew
 /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
-eval "$(/opt/homebrew/bin/brew shellenv)"
+# Homebrew will print the shellenv eval line for your arch — run it to activate
 
 # 2. Clone dotfiles
 git clone https://github.com/<your-username>/dotfiles.git ~/dotfiles
@@ -111,48 +107,20 @@ brew bundle check --file=~/dotfiles/Brewfile
 brew bundle dump --file=~/dotfiles/Brewfile --force
 ```
 
-For profiles that need extra packages beyond the shared baseline, keep the repo `Brewfile` as the source of truth and add a local-only overlay file such as `~/.Brewfile.local`. Run both `brew bundle` commands on the work profile; run only the shared one on personal machines.
-
-## aichat
-
-AI-powered CLI for explaining, generating, and running shell commands. Configured for Anthropic Claude (Opus 4.7, Sonnet 4.6, Haiku 4.5); default is Sonnet 4.6.
-
-**Setup:** export your Anthropic API key as `CLAUDE_API_KEY` in `~/.zshrc.local` (aichat's claude client reads this variable, not `ANTHROPIC_API_KEY`):
-
-```bash
-export CLAUDE_API_KEY="sk-ant-api03-..."
-```
-
-**Usage:**
-
-```bash
-aichat "explain 'find . -type f -mtime -1'"           # ask a question
-aichat -e "list branches merged into main"            # -e: generate+run a shell command
-aichat -c "regex to match semver tags"                # -c: code-only output
-aichat -m claude:claude-opus-4-7 "design a ..."       # pick a different model
-aichat -f ./file.ts "review this for bugs"            # attach a file
-aichat                                                # start a REPL session
-```
-
-**Notes:**
-
-- Config at `~/Library/Application Support/aichat/config.yaml` (symlinked by installer).
-- `require_max_tokens: true` is set per model because Anthropic rejects requests without `max_tokens`.
-- No API key lives in the config file — only in `~/.zshrc.local` so nothing sensitive is committed.
+The repo `Brewfile` is a minimal cross-machine baseline. For machine-specific packages (GUI apps, work tools, fonts, language runtimes), keep a local-only overlay at `~/.Brewfile.local` and run both `brew bundle` commands on that machine.
 
 ## Manual post-install steps
 
 1. **tmux plugins**: Open tmux and press `Ctrl-a` then `I` (capital i) to install TPM plugins
-2. **fzf**: If `~/.fzf.zsh` is missing after install, run: `/opt/homebrew/opt/fzf/install`
+2. **fzf**: The installer sets up fzf shell integration automatically for your architecture. If `~/.fzf.zsh` is missing, re-run `~/dotfiles/install.sh`
 3. **asdf plugins**: Install the nodejs plugin: `asdf plugin add nodejs && asdf install`
 4. **Git credentials**: Set up credential helpers in `~/.gitconfig.local`
-5. **VS Code extensions**: Extensions are listed in the Brewfile and installed via `brew bundle`
-6. **npm global dir**: The installer creates `~/.npm-global` — run `npm config set prefix ~/.npm-global` if not already set
+5. **npm global dir**: The installer creates `~/.npm-global` — run `npm config set prefix ~/.npm-global` if not already set
 
 ## Notes
 
 - Shell is **zsh only** -- no bash configs are managed
-- Catppuccin Mocha is the consistent theme across tmux and VS Code
+- Catppuccin Mocha is the consistent theme across tmux
 - `zsh-autosuggestions` and `zsh-syntax-highlighting` are brew-installed and sourced in `.zshrc`
 - Terminal editor is **micro** (set as `$EDITOR` and `$VISUAL`, configured as git core editor)
 - **git-delta** is configured as the git pager with side-by-side diffs and line numbers

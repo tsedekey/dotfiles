@@ -74,18 +74,6 @@ info "LSD configuration"
 link_file "$DOTFILES_DIR/lsd/config.yaml"      "$HOME/.config/lsd/config.yaml"
 echo ""
 
-# --- aichat ---
-info "aichat configuration"
-link_file "$DOTFILES_DIR/aichat/config.yaml"   "$HOME/Library/Application Support/aichat/config.yaml"
-echo ""
-
-# --- VS Code ---
-info "VS Code configuration"
-VSCODE_USER_DIR="$HOME/Library/Application Support/Code/User"
-link_file "$DOTFILES_DIR/vscode/settings.json"     "$VSCODE_USER_DIR/settings.json"
-link_file "$DOTFILES_DIR/vscode/keybindings.json"  "$VSCODE_USER_DIR/keybindings.json"
-echo ""
-
 # --- GitHub CLI ---
 info "GitHub CLI configuration"
 link_file "$DOTFILES_DIR/gh/config.yml"        "$HOME/.config/gh/config.yml"
@@ -121,7 +109,12 @@ echo ""
 if command -v fzf >/dev/null 2>&1; then
   if [ ! -f "$HOME/.fzf.zsh" ]; then
     info "Setting up fzf shell integration..."
-    /opt/homebrew/opt/fzf/install --key-bindings --completion --no-update-rc --no-fish
+    if [[ "$(uname -m)" == "arm64" ]]; then
+      FZF_INSTALL=/opt/homebrew/opt/fzf/install
+    else
+      FZF_INSTALL=/usr/local/opt/fzf/install
+    fi
+    "$FZF_INSTALL" --key-bindings --completion --no-update-rc --no-fish
     ok "fzf shell integration installed"
   else
     ok "fzf shell integration already present"
