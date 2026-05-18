@@ -44,6 +44,7 @@ alias la='ls -a'
 alias lla='ls -la'
 alias c=clear
 alias m='micro'
+alias ai='aichat'
 alias wrapon='tput rmam'
 alias wrapoff='tput smam'
 
@@ -57,7 +58,7 @@ export PATH="$PATH:/Applications/Docker.app/Contents/Resources/bin"
 # ------------------------------------------------------------
 # asdf (for Maven, Java, etc.)
 # ------------------------------------------------------------
-. /opt/homebrew/opt/asdf/libexec/asdf.sh
+. "${HOMEBREW_PREFIX}/opt/asdf/libexec/asdf.sh"
 
 # ------------------------------------------------------------
 # fzf
@@ -87,8 +88,8 @@ PROMPT='%~${vcs_info_msg_0_} > '
 # ------------------------------------------------------------
 # Plugins (brew-installed)
 # ------------------------------------------------------------
-source /opt/homebrew/share/zsh-autosuggestions/zsh-autosuggestions.zsh
-source /opt/homebrew/share/zsh-syntax-highlighting/zsh-syntax-highlighting.zsh
+source "${HOMEBREW_PREFIX}/share/zsh-autosuggestions/zsh-autosuggestions.zsh"
+source "${HOMEBREW_PREFIX}/share/zsh-syntax-highlighting/zsh-syntax-highlighting.zsh"
 
 # ------------------------------------------------------------
 # Local overrides (not tracked in dotfiles)
