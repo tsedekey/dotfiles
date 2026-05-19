@@ -69,7 +69,6 @@ export PATH="$PATH:/Applications/Docker.app/Contents/Resources/bin"
 # ------------------------------------------------------------
 # asdf (for Maven, Java, etc.)
 # ------------------------------------------------------------
-. "${HOMEBREW_PREFIX}/opt/asdf/libexec/asdf.sh"
 
 # ------------------------------------------------------------
 # fzf
