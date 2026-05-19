@@ -78,17 +78,14 @@ export FZF_DEFAULT_OPTS='--height 40% --layout=reverse'
 eval "$(zoxide init zsh)"
 
 # ------------------------------------------------------------
-# Git branch indicator prompt
+# Prompt
 # ------------------------------------------------------------
 autoload -Uz vcs_info
 precmd() { vcs_info }
-
 setopt PROMPT_SUBST
-
 zstyle ':vcs_info:*' enable git
-zstyle ':vcs_info:git:*' formats ' (%b)'
-
-PROMPT='%~${vcs_info_msg_0_} > '
+zstyle ':vcs_info:git:*' formats ' %%F{244}(%b)%%f'
+PROMPT='%F{111}%~%f${vcs_info_msg_0_} %F{244}❯%f '
 
 # ------------------------------------------------------------
 # Plugins (brew-installed)
