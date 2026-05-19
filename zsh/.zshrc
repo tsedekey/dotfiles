@@ -19,7 +19,6 @@ fi
 # ------------------------------------------------------------
 # Docker CLI completions (must be before compinit)
 # ------------------------------------------------------------
-fpath=("$HOME/.docker/completions" $fpath)
 
 # ------------------------------------------------------------
 # Completion
@@ -42,14 +41,11 @@ setopt APPEND_HISTORY
 # ------------------------------------------------------------
 export EDITOR=micro
 export VISUAL=micro
-export MANPAGER="sh -c 'col -bx | bat -l man -p'"
 
 # ------------------------------------------------------------
 # Aliases
 # ------------------------------------------------------------
 alias lg='lazygit'
-alias ld='lazydocker'
-alias ls='lsd'
 alias l='ls -l'
 alias la='ls -a'
 alias lla='ls -la'
@@ -64,7 +60,6 @@ alias wrapoff='tput smam'
 # ------------------------------------------------------------
 export PATH="$HOME/.local/bin:$PATH"
 export PATH="$HOME/.npm-global/bin:$PATH"
-export PATH="$PATH:/Applications/Docker.app/Contents/Resources/bin"
 
 # ------------------------------------------------------------
 # asdf (for Maven, Java, etc.)
