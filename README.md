@@ -6,24 +6,27 @@ Personal macOS developer environment configuration. Extracted from a live setup 
 
 | Directory | Contents |
 |---|---|
-| `zsh/` | `.zshrc` (tmux auto-launch, completion, history, aliases, fzf+fd, zoxide, vcs_info prompt), `.zprofile` (Homebrew init, auto-detects Apple Silicon vs Intel) |
+| `zsh/` | `.zshrc` (tmux auto-launch, completion, history, aliases, fzf+fd, zoxide, vcs_info prompt, yazi), `.zprofile` (Homebrew init, auto-detects Apple Silicon vs Intel) |
 | `git/` | `.gitconfig` with conventional commit aliases (feat, fix, chore, etc. via `_cc` helper), micro editor, git-delta pager, LFS, pull rebase |
 | `tmux/` | `.tmux.conf` with Catppuccin Mocha theme, Ctrl-a prefix, TPM, resurrect, continuum |
 | `lsd/` | `config.yaml` for the `lsd` ls replacement (icons, git column, header) |
 | `gh/` | GitHub CLI config (https protocol, `co` alias) |
 | `maven/` | `.mvn-flags.list` (flag definitions for Maven workflows) |
 | `asdf/` | `.tool-versions` (node version) |
-| `Brewfile` | Cross-machine Homebrew baseline (taps, formulae) |
+| `ghostty/` | `config` with Catppuccin Mocha theme, JetBrains Mono, shell integration |
+| `Brewfile` | Core Homebrew tools (zsh, tmux, git, editors, dev tools, terminal) |
 
 ## Key tools
 
+- **Terminal**: Ghosty (Catppuccin Mocha, JetBrains Mono, shell integration)
 - **Shell**: zsh (no frameworks) with autosuggestions + syntax highlighting
 - **Terminal editor**: micro
 - **Terminal multiplexer**: tmux (Catppuccin Mocha, Ctrl-a prefix, session restore via resurrect+continuum)
+- **File explorer**: yazi (`yy` for quick access)
 - **Git pager**: delta (side-by-side, line numbers)
 - **File navigation**: fzf + fd, zoxide (`z` for smart cd)
 - **Man pages**: bat as MANPAGER
-- **Theme**: Catppuccin Mocha across tmux
+- **Theme**: Catppuccin Mocha across Ghosty and tmux
 
 ## What's excluded
 
@@ -35,7 +38,6 @@ Personal macOS developer environment configuration. Extracted from a live setup 
 | `~/.ssh/config` | Machine-specific (only contains colima include) |
 | `~/.ssh/known_hosts` | Machine-specific |
 | `~/.config/starship.toml` | Not actively used; excluded by choice |
-| `~/.config/iterm2/` | Auto-managed by iTerm2 |
 | `~/.config/gcloud/` | Machine-specific cloud state |
 | `~/.docker/` | Docker Desktop managed state |
 | `~/.nvm/`, `~/.colima/` | Tool installations, not config |
@@ -68,18 +70,23 @@ exec zsh
 
 Machine-specific or private configuration goes in `.local` files that are sourced by the managed configs but **not tracked** in this repo:
 
-| File | Sourced by |
+| File | Purpose |
 |---|---|
-| `~/.zshrc.local` | `zsh/.zshrc` |
-| `~/.gitconfig.local` | `git/.gitconfig` (via `[include]`) |
+| `~/.zshrc.local` | Google Cloud SDK, Egnyte CLI, and other machine-specific shell config |
+| `~/.Brewfile.local` | Machine-specific Homebrew packages (K8s tools, cloud tools, dev utilities) |
+| `~/.gitconfig.local` | Git credential helpers, work-specific config |
 
-Use these for:
-- Work-specific aliases and paths
-- Credential helpers
-- Private repo URLs
+Use `~/.zshrc.local` for:
 - Google Cloud SDK integration
 - Egnyte CLI integration
-- Any machine-specific exports
+- Machine-specific environment variables
+- Work or machine-specific shell functions
+
+Use `~/.Brewfile.local` for:
+- Kubernetes & container tools (k9s, helm, kubectx, kind, minikube, lazydocker)
+- Cloud infrastructure tools (cloudflared, snyk, etc.)
+- Specialized development utilities
+- Monitoring & observability tools
 
 Example `~/.gitconfig.local`:
 ```ini
@@ -93,21 +100,31 @@ Example `~/.gitconfig.local`:
 
 ## Homebrew packages
 
-```bash
-# Install everything from the Brewfile
-brew bundle --file=~/dotfiles/Brewfile
+### Core packages (portable, in dotfiles)
 
-# On work machines, layer work-only packages from a local Brewfile
-brew bundle --file=~/.Brewfile.local
+```bash
+# Install core Homebrew packages
+brew bundle --file=~/dotfiles/Brewfile
 
 # Check what's missing
 brew bundle check --file=~/dotfiles/Brewfile
+```
 
-# Update the Brewfile from current machine state
+### Local machine-specific packages
+
+```bash
+# Install machine-specific packages (K8s, cloud tools, dev utilities)
+brew bundle --file=~/.Brewfile.local
+
+# Check what's installed vs expected
+brew bundle check --file=~/dotfiles/Brewfile
+brew bundle check --file=~/.Brewfile.local
+
+# Update the core Brewfile from current machine state (use cautiously!)
 brew bundle dump --file=~/dotfiles/Brewfile --force
 ```
 
-The repo `Brewfile` is a minimal cross-machine baseline. For machine-specific packages (GUI apps, work tools, fonts, language runtimes), keep a local-only overlay at `~/.Brewfile.local` and run both `brew bundle` commands on that machine.
+The repo `Brewfile` is a minimal cross-machine baseline. For machine-specific packages (Kubernetes, cloud tools, specialized dev utilities), keep them in `~/.Brewfile.local` and run both `brew bundle` commands on that machine.
 
 ## Manual post-install steps
 
@@ -119,13 +136,15 @@ The repo `Brewfile` is a minimal cross-machine baseline. For machine-specific pa
 
 ## Notes
 
-- Shell is **zsh only** -- no bash configs are managed
-- Catppuccin Mocha is the consistent theme across tmux
-- `zsh-autosuggestions` and `zsh-syntax-highlighting` are brew-installed and sourced in `.zshrc`
-- Terminal editor is **micro** (set as `$EDITOR` and `$VISUAL`, configured as git core editor)
-- **git-delta** is configured as the git pager with side-by-side diffs and line numbers
-- **zoxide** provides smart `cd` via the `z` command
-- **bat** is used as the MANPAGER for colorized man pages
-- **fzf** uses **fd** as its default command for fast, `.gitignore`-aware file finding
-- Conventional commit aliases (`git feat`, `git fix`, etc.) use a shared `cc` helper to avoid duplication
-- Work-specific functions (Maven `mci`, `kibana` helper) are not included -- add them to `~/.zshrc.local` if needed
+- **Shell**: zsh only — bash configs are not managed (all shell config lives in `.zshrc` and `.zshrc.local`)
+- **Theme**: Catppuccin Mocha is consistent across Ghosty and tmux
+- **Plugins**: `zsh-autosuggestions` and `zsh-syntax-highlighting` are brew-installed and sourced
+- **Terminal editor**: micro (set as `$EDITOR` and `$VISUAL`, configured as git core editor)
+- **File explorer**: yazi (`yy` alias) for interactive file browsing
+- **Git pager**: git-delta with side-by-side diffs and line numbers
+- **Smart cd**: zoxide provides `z` command for directory jumping
+- **Man pages**: bat is used as MANPAGER for colorized output
+- **Fuzzy finding**: fzf uses fd as default command for fast, `.gitignore`-aware file finding
+- **Git aliases**: Conventional commit aliases (`git feat`, `git fix`, etc.)
+- **TMUX**: Auto-launches on shell startup, connects to `main` session
+- **Brewfile strategy**: Core tools in `dotfiles/Brewfile` (portable), specialized tools in `~/.Brewfile.local` (machine-specific)

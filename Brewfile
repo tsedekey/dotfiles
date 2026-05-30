@@ -21,6 +21,9 @@ brew "jq"
 # Editor
 brew "micro"
 
+# File explorer
+brew "yazi"
+
 # Version management and build
 brew "asdf"
 brew "make"
@@ -29,4 +32,5 @@ brew "make"
 brew "htop"
 
 # Terminal
-cask "alacritty"
+cask "ghostty"
+cask "font-jetbrains-mono-nerd-font"

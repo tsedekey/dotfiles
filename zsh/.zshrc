@@ -1,3 +1,5 @@
+export COLORTERM=truecolor
+
 # ------------------------------------------------------------
 # Homebrew (ensure HOMEBREW_PREFIX is set for non-login shells)
 # ------------------------------------------------------------
@@ -52,6 +54,7 @@ alias lla='ls -la'
 alias c=clear
 alias m='micro'
 alias ai='aichat'
+alias yy='yazi'
 alias wrapon='tput rmam'
 alias wrapoff='tput smam'
 
@@ -63,7 +66,9 @@ export PATH="$HOME/.npm-global/bin:$PATH"
 
 # ------------------------------------------------------------
 # asdf (for Maven, Java, etc.)
+# asdf >= 0.16 is a compiled binary — no shell init script; shims just need to be on PATH
 # ------------------------------------------------------------
+export PATH="$HOME/.asdf/shims:$PATH"
 
 # ------------------------------------------------------------
 # fzf
