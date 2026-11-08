@@ -1,0 +1,124 @@
+# ~/.config/workmux/config.yaml  (symlinked from ~/dotfiles/workmux/config.yaml)
+#
+# Layout: ONE tmux SESSION per workflow (you run `tmux new -s <workflow>`),
+#         ONE workmux WINDOW per task (`wm add <branch>` inside that session).
+#
+# Rules baked in here:
+#  - Work code only goes through claude (work profile), copilot, or opencode.
+#    NEVER claude-personal for work code.
+#  - PERMISSIONS (decided 2026-11-07): the three work harnesses (claude, copilot,
+#    opencode) default to the HIGHEST permission level, set explicitly in each
+#    agent below via args/env. Restrict per session by launching a "-safe" variant
+#    (`wm add <branch> -a claude-safe`). This replaces the earlier "never bypass" rule.
+#    The global ~/.claude, ~/.copilot and ~/.config/opencode settings are NOT changed.
+#    claude-personal is deliberately left at its own defaults.
+#  - workmux's own skip-permissions injection is tied to sandbox.enabled, which stays
+#    off; the flags below are ours, not workmux's.
+#  - Panes inherit the tmux SERVER's environment, so every agent sets its own env.
+#    Absolute paths (no "~"): workmux builds `env KEY=VALUE cmd`, tilde is not safe there.
+
+nerdfont: true
+base_branch: auto                       # branch from the repo's main, not whatever is checked out
+worktree_dir: ~/dev/camunda/worktrees/{project}   # subfolder per repo; existing flat worktrees untouched
+mode: window                            # window per task, inside the current tmux session
+agent: claude                          # default = the work Claude profile
+
+# Telemetry / pings: workmux has no analytics. Its only network call is a daily
+# GitHub release check; turn it off.
+auto_update_check: false
+
+sandbox:
+  enabled: false                        # keeps skip-permissions flags from ever being injected
+
+# Pane layout for new worktrees: the agent, plus a plain shell split below.
+panes:
+  - command: <agent>
+    focus: true
+  - split: horizontal
+    size: 20
+
+agents:
+  # Work Claude profile. Default = full bypass.
+  # NOTE: bypass mode skips your autoMode soft_deny guards (force-push, terraform apply).
+  claude:
+    type: claude
+    command: claude
+    args:
+      - --permission-mode
+      - bypassPermissions
+    env:
+      NO_ANON_PING: "1"                 # Plannotator ping off (only opt-out)
+      PLANNOTATOR_PLAN_REVIEW: "0"      # inert on pinned v0.28.51; honoured after an upgrade
+      CLAUDE_CONFIG_DIR: /Users/eddie.tsedeke/.claude
+
+  # Same work profile, restricted: Claude asks before writes and commands.
+  claude-safe:
+    type: claude
+    command: claude
+    args:
+      - --permission-mode
+      - manual
+    env:
+      NO_ANON_PING: "1"                 # Plannotator ping off (only opt-out)
+      PLANNOTATOR_PLAN_REVIEW: "0"      # inert on pinned v0.28.51; honoured after an upgrade
+      CLAUDE_CONFIG_DIR: /Users/eddie.tsedeke/.claude
+
+  # Personal Claude profile. NOT for work code.
+  claude-personal:
+    type: claude
+    command: claude
+    env:
+      NO_ANON_PING: "1"                 # Plannotator ping off (only opt-out)
+      PLANNOTATOR_PLAN_REVIEW: "0"      # inert on pinned v0.28.51; honoured after an upgrade
+      CLAUDE_CONFIG_DIR: /Users/eddie.tsedeke/.claude-personal
+
+  # GitHub Copilot CLI. No built-in launch profile, so it is a plain command; status
+  # tracking comes from hooks in ~/.copilot/hooks (added by `workmux setup`).
+  # Copilot has no "waiting" status icon.
+  # Default = --allow-all (explicit here so it does not depend on ~/.copilot/settings.json).
+  # No "-safe" variant: Copilot has no CLI flag to force manual mode while your settings
+  # say allow-all; restrict by changing defaultPermissionMode in ~/.copilot/settings.json.
+  copilot:
+    command: copilot
+    args:
+      - --allow-all
+    env:
+      NO_ANON_PING: "1"                 # Plannotator ping off (only opt-out)
+      PLANNOTATOR_PLAN_REVIEW: "0"      # inert on pinned v0.28.51; honoured after an upgrade
+      COPILOT_HOME: /Users/eddie.tsedeke/.copilot
+
+  # OpenCode on an OpenRouter model, using a provisioned OpenRouter key
+  # (US region; see ~/.config/opencode/opencode.json).
+  # The key is NOT in this file: the wrapper reads it from the macOS keychain
+  # (service openrouter-opencode) at launch and exports OPENROUTER_API_KEY.
+  # Model: deepseek-v4-flash-0731, the cheap/fast default for daily, explainers and
+  # exploration. Switch to kimi-k3.1-pro (coding) or glm-5.2 (long context) in the
+  # OpenCode model picker (/models) when a task needs it.
+  #
+  # Permission: allow everything (OPENCODE_PERMISSION). Provider: openrouter ONLY
+  # (OPENCODE_CONFIG_CONTENT), so a bad/missing model can never silently fall back to the
+  # OpenAI / GitHub logins in OpenCode's auth.json (that happened in the Phase 1 check).
+  opencode:
+    type: opencode
+    command: /Users/eddie.tsedeke/.local/bin/opencode-openrouter
+    args:
+      - --model
+      - openrouter/deepseek/deepseek-v4-flash-0731
+    env:
+      NO_ANON_PING: "1"                 # Plannotator ping off (only opt-out)
+      PLANNOTATOR_PLAN_REVIEW: "0"      # inert on pinned v0.28.51; honoured after an upgrade
+      OPENCODE_PERMISSION: '{"*":"allow"}'
+      OPENCODE_CONFIG_CONTENT: '{"enabled_providers":["openrouter"]}'
+
+  # Same, but OpenCode asks before every tool use.
+  opencode-safe:
+    type: opencode
+    command: /Users/eddie.tsedeke/.local/bin/opencode-openrouter
+    args:
+      - --model
+      - openrouter/deepseek/deepseek-v4-flash-0731
+    env:
+      NO_ANON_PING: "1"                 # Plannotator ping off (only opt-out)
+      PLANNOTATOR_PLAN_REVIEW: "0"      # inert on pinned v0.28.51; honoured after an upgrade
+      OPENCODE_PERMISSION: '{"*":"ask"}'
+      OPENCODE_CONFIG_CONTENT: '{"enabled_providers":["openrouter"]}'
