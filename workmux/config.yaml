@@ -63,6 +63,27 @@ agents:
       PLANNOTATOR_PLAN_REVIEW: "0"      # inert on pinned v0.28.51; honoured after an upgrade
       CLAUDE_CONFIG_DIR: /Users/eddie.tsedeke/.claude
 
+  # dagrunner DRIVER (work Claude profile). It runs inside the same worktree the dagrunner
+  # nodes use, and dagrunner seeds that worktree's .claude/ for the nodes (Stop/SessionStart
+  # hooks, acceptEdits, deny rules, MCP servers). `--setting-sources user` keeps all of that,
+  # and the repo's project CLAUDE.md, out of THIS session (checked 2026-11-08 in a scratch
+  # project: project hooks, permission mode, commands and CLAUDE.md all stop loading).
+  # User-level skills (dagrunner-driver) and the workmux status hooks in ~/.claude/settings.json
+  # still load. Same bypass default as `claude`; use for dagrunner runs only:
+  #   wm add <branch> -a claude-driver
+  claude-driver:
+    type: claude
+    command: claude
+    args:
+      - --permission-mode
+      - bypassPermissions
+      - --setting-sources
+      - user
+    env:
+      NO_ANON_PING: "1"                 # Plannotator ping off (only opt-out)
+      PLANNOTATOR_PLAN_REVIEW: "0"      # inert on pinned v0.28.51; honoured after an upgrade
+      CLAUDE_CONFIG_DIR: /Users/eddie.tsedeke/.claude
+
   # Personal Claude profile. NOT for work code.
   claude-personal:
     type: claude
