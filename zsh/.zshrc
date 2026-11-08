@@ -140,4 +140,22 @@ alias ccp='CLAUDE_CONFIG_DIR=~/.claude-personal claude'
 # Run claude -p from home dir so only user-level settings apply (bypasses project/local settings)
 ccc() { (cd ~ && claude -p "$@"); }
 
+# --- workmux: a Copilot window on an EXISTING checkout (no new worktree) ---
+# `wm add` always creates a worktree, so plan and PR-review windows (main checkout) and
+# babysit/triage windows (an existing worktree) use `workmux open`, which has no agent
+# flag; --config with `agent: copilot` picks Copilot. Run it inside tmux, from the repo.
+#   wmc                    Copilot on the main checkout
+#   wmc main plan-99001    ... in a window named plan-99001
+#   wmc <handle> [name]    Copilot on an existing worktree (handle = name in `wm ls`)
+# Always a NEW window (-n), so several can coexist. workmux remembers the last name given
+# for a handle (later opens get -2, -3), so always pass one for the main checkout.
+# `wm rm main` refuses, and
+# `wm rm --all/--gone` skip the main checkout, so these windows are safe from them.
+wmc() {
+  local handle="${1:-main}" name="${2:-}"
+  local -a extra
+  [[ -n $name ]] && extra=(--target-name "$name")
+  workmux open "$handle" -n "${extra[@]}" --config "$HOME/dotfiles/workmux/copilot-window.yaml"
+}
+
 eval "$(atuin init zsh)"

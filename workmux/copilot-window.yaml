@@ -1,0 +1,4 @@
+# Used by `wmc` (dotfiles/zsh/.zshrc): `workmux open <handle> --config <this file>` starts
+# Copilot instead of the default agent, in a window on an EXISTING checkout (no new worktree).
+# It merges with config.yaml, so the copilot agent's args and env come from there.
+agent: copilot
