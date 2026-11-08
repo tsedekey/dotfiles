@@ -16,14 +16,11 @@ set -euo pipefail
 # tmux's global PATH does not include ~/.local/bin (where plannotator lives).
 export PATH="$HOME/.local/bin:/opt/homebrew/bin:$PATH"
 
-# Roots searched for *.md and *.html. Target state: camunda/ only. The DagRunner
-# entries go away once DAGRUNNER_HOME is moved under camunda/ (separate task).
-# dagrunner/worktrees is deliberately absent: full repo checkouts, not artifacts.
+# Root searched for *.md and *.html. Everything the agents leave behind lives under camunda/
+# (dagrunner's home moved to camunda/dagrunner in dagrunner v0.1.85). A legacy dagrunner worktree is
+# a full repo checkout, not an artifact, so camunda/dagrunner/worktrees is pruned should one reappear.
 ROOTS=(
   "$HOME/.local/share/camunda"
-  "$HOME/.local/share/dagrunner/inbox"
-  "$HOME/.local/share/dagrunner/runs"
-  "$HOME/.local/share/dagrunner/ui-mockup-recovered"
 )
 
 # Output: "<MM-DD HH:MM>\t<short path>\t<full path>", newest first.
@@ -31,7 +28,7 @@ list() {
   local r
   for r in "${ROOTS[@]}"; do
     [ -d "$r" ] || continue
-    find "$r" \( -name node_modules -o -name .git \) -prune -o \
+    find "$r" \( -name node_modules -o -name .git -o -path "$r/dagrunner/worktrees" \) -prune -o \
       -type f \( -name '*.md' -o -name '*.html' \) \
       -exec stat -t '%m-%d %H:%M' -f '%m%t%Sm%t%N' {} +
   done |
