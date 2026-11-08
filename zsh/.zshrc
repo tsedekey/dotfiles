@@ -12,10 +12,18 @@ if [ -z "$HOMEBREW_PREFIX" ]; then
 fi
 
 # ------------------------------------------------------------
-# Tmux auto-launch (attach to main or create it)
+# Tmux auto-launch (attach to main, or give the window its own
+# session if main is already attached elsewhere — avoids
+# multiple differently-sized clients fighting over one session)
 # ------------------------------------------------------------
 if command -v tmux &>/dev/null && [ -z "$TMUX" ]; then
-  tmux attach -t main 2>/dev/null || tmux new -s main
+  if ! tmux has-session -t main 2>/dev/null; then
+    tmux new -s main
+  elif [ -z "$(tmux list-clients -t main 2>/dev/null)" ]; then
+    tmux attach -t main
+  else
+    tmux new -s "term-$$"
+  fi
 fi
 
 # ------------------------------------------------------------
@@ -48,13 +56,15 @@ export VISUAL=micro
 # Aliases
 # ------------------------------------------------------------
 alias lg='lazygit'
-alias l='ls -l'
-alias la='ls -a'
-alias lla='ls -la'
+alias l='lsd'
+alias ll='lsd -l'
+alias la='lsd -a'
+alias lla='lsd -la'
+alias lt='lsd --tree'
 alias c=clear
 alias m='micro'
-alias ai='aichat'
-alias yy='yazi'
+alias md='leaf'
+alias dr='dagrun'
 alias wrapon='tput rmam'
 alias wrapoff='tput smam'
 
@@ -103,3 +113,31 @@ source "${HOMEBREW_PREFIX}/share/zsh-syntax-highlighting/zsh-syntax-highlighting
 # ------------------------------------------------------------
 # shellcheck disable=SC1090
 [ -f ~/.zshrc.local ] && source ~/.zshrc.local
+
+# bun completions
+[ -s "/Users/eddie.tsedeke/.bun/_bun" ] && source "/Users/eddie.tsedeke/.bun/_bun"
+
+# bun
+export BUN_INSTALL="$HOME/.bun"
+export PATH="$BUN_INSTALL/bin:$PATH"
+
+# ------------------------------------------------------------
+# Yazi shell wrapper
+# ------------------------------------------------------------
+function y() {
+	local tmp="$(mktemp -t "yazi-cwd.XXXXXX")" cwd
+	command yazi "$@" --cwd-file="$tmp"
+	IFS= read -r -d '' cwd < "$tmp"
+	[ "$cwd" != "$PWD" ] && [ -d "$cwd" ] && builtin cd -- "$cwd"
+	command rm -f -- "$tmp"
+}
+
+# --- Claude Code profiles ---
+# Work profile (default ~/.claude — Desktop app compatible)
+alias ccw='CLAUDE_CONFIG_DIR=~/.claude claude'
+# Personal / machine-aware
+alias ccp='CLAUDE_CONFIG_DIR=~/.claude-personal claude'
+# Run claude -p from home dir so only user-level settings apply (bypasses project/local settings)
+ccc() { (cd ~ && claude -p "$@"); }
+
+eval "$(atuin init zsh)"
