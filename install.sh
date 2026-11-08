@@ -89,6 +89,16 @@ info "asdf tool versions"
 link_file "$DOTFILES_DIR/asdf/.tool-versions"  "$HOME/.tool-versions"
 echo ""
 
+# --- Ghostty ---
+info "Ghostty configuration"
+link_file "$DOTFILES_DIR/ghostty/config"       "$HOME/.config/ghostty/config"
+echo ""
+
+# --- workmux ---
+info "workmux configuration"
+link_file "$DOTFILES_DIR/workmux/config.yaml"  "$HOME/.config/workmux/config.yaml"
+echo ""
+
 # =============================================================
 # Post-install: TPM (tmux plugin manager)
 # =============================================================
