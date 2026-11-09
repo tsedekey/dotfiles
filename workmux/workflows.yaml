@@ -35,6 +35,11 @@ workflows:
     agent: claude-driver
     dir: ~/dev/camunda/camunda        # repo `workmux add` runs from; asks for the branch
 
+  epic:                                # agent + model: Eddie; dir: where define-companion keeps epics
+    agent: claude                      # discovery, define, task breakdown: thinking work, no worktree
+    model: claude-sonnet-5-5           # Claude ids are hyphenated (Copilot's are claude-sonnet-5.5)
+    dir: ~/.local/share/camunda/feature-work-companion/epics   # epics/<epic-slug>/ per epic
+
   review:                              # (guess) agent, model
     agent: copilot
     model: claude-sonnet-5.5
