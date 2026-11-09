@@ -147,20 +147,30 @@ agents:
 
 # Sidebar tiles (workmux sidebar, `prefix B` toggles it). Each template line is one row of a tile; the
 # tile text area is only ~19 columns wide, `{fill}` splits a line into a left and a right part.
-# Added to the defaults: the tmux SESSION (change, epic, review, ...) and the AGENT (Claude, Copilot,
-# Opencode) on their own row, so they read the same for every window. `{secondary}` is not used: it is
-# a label chain (worktree / window / session / project) and means different things per window.
+# Added to the defaults: the tmux SESSION (change, epic, review, ...) and the AGENT's icon on their own
+# row, so they read the same for every window. `{secondary}` is not used: it is a label chain
+# (worktree / window / session / project) and means different things per window.
 #   row 1  window name ............ time since the agent's last status change
-#   row 2  tmux session ........... agent
+#   row 2  tmux session ........... agent icon (colour = the agent's default brand colour)
 #   row 3  directory (project) .... git branch, uncommitted/committed diff stats
 #   row 4  agent session title .... PR number and checks
 # After editing this file run `touch -h ~/.config/workmux/config.yaml`: the sidebar's file watcher
 # only sees changes to the symlink itself, not to the dotfiles file behind it.
+#
+# Agent icons: workmux's defaults are letters (CC, CP, OC). Nerd Fonts 3.4.0 has NO Claude or OpenCode
+# brand glyph (checked in JetBrainsMono Nerd Font), so Claude uses the asterisk Claude Code itself shows
+# in session titles, Copilot its real Octicons logo, OpenCode a code-braces glyph. Written as \u escapes
+# so the codepoints stay visible. A bare string keeps the default colour; `{icon: ..., color: ...}`
+# would change it. Codepoints read from the font file: oct-copilot U+F4B8, md-code_braces U+F0169.
 sidebar:
+  agent_icons:
+    claude: "\u2733"        # ✳  eight-spoked asterisk (Claude Code's own marker)
+    copilot: "\uF4B8"       # nf-oct-copilot
+    opencode: "\U000F0169"  # nf-md-code_braces
   templates:
     compact: "{status_icon} {primary} {pane_suffix} {fill} {session} {agent_icon}"
     tiles:
       - "{primary} {pane_suffix} {fill} {elapsed}"
-      - "#[fg=cyan]{session}#[default] {fill} {agent_label}"
+      - "#[fg=cyan]{session}#[default] {fill} {agent_icon}"
       - "{project} {fill} {git_branch} {git_stats}"
       - "{pane_title} {fill} {pr_number} {pr_checks}"
