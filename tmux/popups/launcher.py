@@ -79,6 +79,8 @@ def make_plan(name, wfs, agents, o):
     for k in ("agent", "model", "window", "dir"):
         if o.get(k) is not None:
             p[k] = o[k]
+    if p["agent"] != wfs[name]["agent"] and o.get("model") is None:
+        p["model"] = ""  # the default model is the old agent's (Copilot ids are not Claude ids)
     p["dir"] = os.path.expanduser(p["dir"])
     if p["agent"] not in agents:
         raise Fail(f"agent '{p['agent']}' is not defined (have: {', '.join(agents)})")
@@ -97,9 +99,15 @@ def make_plan(name, wfs, agents, o):
 def agent_line(agents, agent, model):
     """`env K=V ... <command> <args> [--model M]`, the same shape workmux types into a pane."""
     a = agents[agent]
-    argv = [str(a["command"]), *map(str, a.get("args") or [])]
-    if model:
-        argv += ["--model", model]
+    args, skip = [], False
+    for x in map(str, a.get("args") or []):
+        if skip:
+            skip = False
+        elif model and x == "--model":
+            skip = True  # drop the agent's own `--model X` pair; the override replaces it
+        elif not (model and x.startswith("--model=")):
+            args.append(x)
+    argv = [str(a["command"]), *args] + (["--model", model] if model else [])
     env = [f"{k}={v}" for k, v in (a.get("env") or {}).items()]
     return shlex.join((["env", *env] if env else []) + argv)
 
@@ -157,9 +165,10 @@ def pick(wfs):
         model = w["model"] or ("-" if w["kind"] == "worktree" else "(default)")
         rows.append(f"{n:<14} {w['agent']:<14} {model:<18} {short(os.path.expanduser(w['dir']))}")
     # Columns are space-padded; two+ spaces end the first field, so --nth=1 matches the workflow
-    # name only (typing "bet" must not fuzzy-match a path or agent column).
+    # name only (typing "bet" must not fuzzy-match a path or agent column). --tiebreak=index: on a
+    # tie YAML order wins, so typing "change" + Enter picks `change plan`, the first listed.
     r = subprocess.run(
-        ["fzf", "--delimiter=\\s{2,}", "--nth=1", "--expect=tab", "--layout=reverse",
+        ["fzf", "--delimiter=\\s{2,}", "--nth=1", "--tiebreak=index", "--expect=tab", "--layout=reverse",
          "--info=hidden", "--prompt=workflow> ",
          "--header=enter: launch with defaults    tab: edit fields    esc: cancel\n"
                    "workflow        agent          model              directory"],
@@ -188,7 +197,9 @@ def edit(wf, agents, o):
             break
         print(f"  unknown agent '{o['agent']}'")
     if wf["kind"] == "window":
-        o["model"] = ask("model (empty = harness default)", wf["model"])
+        same = o["agent"] == wf["agent"]  # the workflow's model belongs to its own agent
+        o["model"] = ask("model (empty = harness default)" if same else "model (agent changed: harness default)",
+                         wf["model"] if same else "")
         o["window"] = ask("window name (empty = auto)", wf["window"])
     else:
         o["window"] = ask("window name (empty = branch name)", wf["window"])

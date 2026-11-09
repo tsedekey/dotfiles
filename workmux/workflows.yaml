@@ -3,6 +3,8 @@
 # One entry per workflow. The key is what you pick in the popup; the FIRST WORD is the tmux
 # session ("change plan" and "change run" both live in session `change`) unless `session:` is set.
 # Pressing Enter on a workflow launches with exactly these values; Tab lets you edit them first.
+# Typing filters by workflow name only; on a tie the FIRST listed wins, so "change" + Enter
+# picks `change plan`. Keep the workflow you launch most often above its siblings.
 #
 #   kind    window (default)  a plain tmux window; the agent is typed into its shell.
 #                             Needs no git repo, so workspaces under ~/.local/share/camunda work.
