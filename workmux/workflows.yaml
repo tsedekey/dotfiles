@@ -1,0 +1,54 @@
+# Defaults for the workflow launcher (tmux/popups/launcher.py, tmux prefix + N).
+#
+# One entry per workflow. The key is what you pick in the popup; the FIRST WORD is the tmux
+# session ("change plan" and "change run" both live in session `change`) unless `session:` is set.
+# Pressing Enter on a workflow launches with exactly these values; Tab lets you edit them first.
+#
+#   kind    window (default)  a plain tmux window; the agent is typed into its shell.
+#                             Needs no git repo, so workspaces under ~/.local/share/camunda work.
+#           worktree          `workmux add <branch> -a <agent> --parent-session <session>` run from
+#                             `dir` (a git repo). Creates a worktree; asks for the branch.
+#   agent   a name from `agents:` in ~/.config/workmux/config.yaml (env, args and command come from
+#           there, so profiles never drift). Typos are a load error, not a runtime surprise.
+#   model   passed as `--model <model>`; empty = the harness' own default. Not allowed for worktree.
+#   dir     working directory of the agent (~ expanded). Must exist.
+#   window  window name; empty = "<last word of the workflow>-<HHMM>", e.g. plan-0712.
+#
+# Monitoring needs nothing here: every window is tracked by the agents' workmux hooks.
+# Values marked (guess) were seeded without checking with Eddie; edit freely.
+
+workflows:
+  change plan:
+    agent: copilot
+    model: claude-sonnet-5.5
+    dir: ~/dev/camunda/camunda        # main checkout, no worktree (plan stage)
+
+  change run:
+    kind: worktree
+    agent: claude-driver
+    dir: ~/dev/camunda/camunda        # repo `workmux add` runs from; asks for the branch
+
+  review:                              # (guess) agent, model
+    agent: copilot
+    model: claude-sonnet-5.5
+    dir: ~/dev/camunda/camunda
+
+  investigate:                         # (guess) agent, dir
+    agent: claude
+    dir: ~/dev/camunda/camunda
+
+  assess:                              # (guess) agent, dir
+    agent: claude
+    dir: ~/.local/share/camunda/cve-companion
+
+  medic:                               # (guess) agent, dir
+    agent: claude
+    dir: ~/dev/camunda/camunda
+
+  release:                             # (guess) agent, dir
+    agent: claude
+    dir: ~/dev/camunda/camunda
+
+  daily:                               # (guess) agent
+    agent: claude
+    dir: ~/.local/share/camunda/daily

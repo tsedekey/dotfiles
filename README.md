@@ -8,7 +8,7 @@ Personal macOS developer environment configuration. Extracted from a live setup 
 |---|---|
 | `zsh/` | `.zshrc` (tmux auto-launch, completion, history, aliases, fzf+fd, zoxide, vcs_info prompt, yazi), `.zprofile` (Homebrew init, auto-detects Apple Silicon vs Intel) |
 | `git/` | `.gitconfig` with conventional commit aliases (feat, fix, chore, etc. via `_cc` helper), micro editor, git-delta pager, LFS, pull rebase |
-| `tmux/` | `.tmux.conf` with Catppuccin Mocha theme, Ctrl-a prefix, TPM, resurrect, continuum |
+| `tmux/` | `.tmux.conf` with Catppuccin Mocha theme, Ctrl-a prefix, TPM, resurrect, continuum, popups: `prefix a` artifact picker, `prefix W` workmux dashboard, `prefix N` workflow launcher (`tmux/popups/launcher.py`, defaults in `workmux/workflows.yaml`) |
 | `lsd/` | `config.yaml` for the `lsd` ls replacement (icons, git column, header) |
 | `gh/` | GitHub CLI config (https protocol, `co` alias) |
 | `maven/` | `.mvn-flags.list` (flag definitions for Maven workflows) |
