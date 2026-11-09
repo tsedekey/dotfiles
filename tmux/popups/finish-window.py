@@ -74,7 +74,8 @@ def agent_status():
 
 
 def find_worktree(win):
-    """The non-main worktree this window works in, or None (plain window)."""
+    """The non-main worktree this window works in, or None (plain window). Every pane is checked: an
+    agent pane that wandered into the main checkout must not hide the worktree next to it."""
     for p in win["panes"]:
         if p["cmd"] == "workmux":
             continue
@@ -85,7 +86,9 @@ def find_worktree(win):
         top = run(["git", "rev-parse", "--show-toplevel"], cwd=p["path"])[1]
         for r in rows:
             if r["path"] == top:
-                return None if r["is_main"] else r
+                if r["is_main"]:
+                    break  # this pane is in the main checkout; keep looking at the others
+                return r
         bare = re.sub(r"^[^A-Za-z0-9]+", "", win["name"])  # workmux prefixes an icon
         for r in rows:
             if not r["is_main"] and r["handle"] == bare:
@@ -100,7 +103,10 @@ def git(wt, *args):
 def worktree_state(wt):
     """-> (merged_and_clean, [reasons it is not], [facts to show])"""
     facts, reasons = [], []
-    dirty = [l for l in git(wt, "status", "--porcelain")[1].splitlines() if l]
+    rc, out, err = git(wt, "status", "--porcelain")
+    if rc:  # fail closed: if git cannot say the tree is clean, it is not
+        reasons.append(f"cannot read git status ({err or 'git failed'})")
+    dirty = [l for l in out.splitlines() if l]
     if dirty:
         reasons.append(f"{len(dirty)} uncommitted or untracked file(s)")
     head = git(wt, "rev-parse", "HEAD")[1]
