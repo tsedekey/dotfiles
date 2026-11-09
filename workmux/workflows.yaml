@@ -6,13 +6,18 @@
 # Typing filters by workflow name only; on a tie the FIRST listed wins, so "change" + Enter
 # picks `change plan`. Keep the workflow you launch most often above its siblings.
 #
-#   kind    window (default)  a plain tmux window; the agent is typed into its shell.
-#                             Needs no git repo, so workspaces under ~/.local/share/camunda work.
-#           worktree          `workmux add <branch> -a <agent> --parent-session <session>` run from
-#                             `dir` (a git repo). Creates a worktree; asks for the branch.
+#   worktree  false (default)  a plain tmux window in `dir`; the agent is typed into its shell. No git
+#                              repo needed, so workspaces under ~/.local/share/camunda work. Plans,
+#                              reviews, investigations, assessments, medic, release and daily start
+#                              here: read-only work can fetch a branch without a worktree.
+#             true             first creates a worktree: `workmux add <branch> -a <agent>
+#                              --parent-session <session>`, run from `dir` (a git repo). Asks for the
+#                              branch. Only for work that changes code (change run). The Tab flow in
+#                              the popup can switch it on or off for a single launch.
 #   agent   a name from `agents:` in ~/.config/workmux/config.yaml (env, args and command come from
 #           there, so profiles never drift). Typos are a load error, not a runtime surprise.
-#   model   passed as `--model <model>`; empty = the harness' own default. Not allowed for worktree.
+#   model   passed as `--model <model>`; empty = the harness' own default. workmux add has no model
+#           flag, so with a worktree the default is ignored (with a note) and an explicit --model errors.
 #   dir     working directory of the agent (~ expanded). Must exist.
 #   window  window name; empty = "<last word of the workflow>-<HHMM>", e.g. plan-0712.
 #
@@ -26,7 +31,7 @@ workflows:
     dir: ~/dev/camunda/camunda        # main checkout, no worktree (plan stage)
 
   change run:
-    kind: worktree
+    worktree: true                    # the only workflow that changes code, so the only worktree
     agent: claude-driver
     dir: ~/dev/camunda/camunda        # repo `workmux add` runs from; asks for the branch
 

@@ -10,7 +10,7 @@ Defaults live in dotfiles/workmux/workflows.yaml.  Agent command, args and env a
 `agents:` block of ~/.config/workmux/config.yaml, so the profiles stay defined in one place.
 The session is the workflow's first word and is created when missing.  Every window is monitored
 because the agents' own workmux hooks register the pane; nothing here talks to workmux except
-`kind: worktree`, which runs `workmux add`.
+`worktree: true`, which runs `workmux add`.
 
 Env: LAUNCHER_WORKFLOWS / LAUNCHER_AGENTS_CONFIG override the two config paths (tests use them).
 """
@@ -27,8 +27,7 @@ HOME = os.path.expanduser("~")
 os.environ["PATH"] = f"{HOME}/.local/bin:/opt/homebrew/bin:{os.environ.get('PATH', '')}"
 WORKFLOWS = os.environ.get("LAUNCHER_WORKFLOWS", f"{HOME}/dotfiles/workmux/workflows.yaml")
 AGENTS_CONFIG = os.environ.get("LAUNCHER_AGENTS_CONFIG", f"{HOME}/.config/workmux/config.yaml")
-KINDS = ("window", "worktree")
-FIELDS = {"kind", "session", "agent", "model", "dir", "window"}
+FIELDS = {"worktree", "session", "agent", "model", "dir", "window"}
 SPLIT = "20%"  # shell pane BESIDE the agent (right), like workmux's `split: horizontal` layout
 
 
@@ -54,17 +53,17 @@ def load():
     for name, w in list(wfs.items()):
         w = wfs[name] = dict(w or {})
         where = f"{WORKFLOWS}: workflow '{name}'"
+        if "kind" in w:
+            raise Fail(f"{where}: `kind` was replaced by `worktree: true|false` (default false)")
         if set(w) - FIELDS:
             raise Fail(f"{where}: unknown field(s) {sorted(set(w) - FIELDS)}; allowed {sorted(FIELDS)}")
-        w["kind"] = w.get("kind") or "window"
-        if w["kind"] not in KINDS:
-            raise Fail(f"{where}: kind '{w['kind']}' is not one of {KINDS}")
+        w["worktree"] = w.get("worktree", False)
+        if not isinstance(w["worktree"], bool):
+            raise Fail(f"{where}: worktree must be true or false, not {w['worktree']!r}")
         if w.get("agent") not in agents:
             raise Fail(f"{where}: agent '{w.get('agent')}' is not in {AGENTS_CONFIG} (have: {', '.join(agents)})")
         if not w.get("dir"):
             raise Fail(f"{where}: dir is required")
-        if w["kind"] == "worktree" and w.get("model"):
-            raise Fail(f"{where}: model is not supported for kind worktree (workmux add has no model flag)")
         w["session"] = w.get("session") or name.split()[0]
         w["model"] = w.get("model") or ""
         w["window"] = w.get("window") or ""
@@ -75,8 +74,8 @@ def make_plan(name, wfs, agents, o):
     """Workflow defaults + overrides (None = keep default, "" = blank) -> a validated plan."""
     if name not in wfs:
         raise Fail(f"unknown workflow '{name}'. Known: {', '.join(wfs)}")
-    p = dict(wfs[name], name=name, branch=o.get("branch") or "")
-    for k in ("agent", "model", "window", "dir"):
+    p = dict(wfs[name], name=name, branch=o.get("branch") or "", note="")
+    for k in ("agent", "model", "window", "dir", "worktree"):
         if o.get(k) is not None:
             p[k] = o[k]
     if p["agent"] != wfs[name]["agent"] and o.get("model") is None:
@@ -86,12 +85,17 @@ def make_plan(name, wfs, agents, o):
         raise Fail(f"agent '{p['agent']}' is not defined (have: {', '.join(agents)})")
     if not os.path.isdir(p["dir"]):
         raise Fail(f"directory does not exist: {p['dir']}")
-    if p["kind"] == "worktree":
-        if p["model"]:
-            raise Fail("model is not supported for worktree workflows")
+    if p["worktree"]:
+        if o.get("model"):
+            raise Fail("--model cannot be combined with a worktree (workmux add has no model flag)")
+        if p["model"]:  # only the workflow's default: yield to the worktree, visibly
+            p["note"] = f"default model '{p['model']}' ignored: workmux add has no model flag"
+            p["model"] = ""
         if not p["branch"]:
             raise Fail(f"'{name}' creates a worktree and needs a branch (--branch)")
     else:
+        if p["branch"]:
+            raise Fail("a branch only applies to a worktree (add --worktree)")
         p["window"] = p["window"] or f"{name.split()[-1]}-{datetime.datetime.now():%H%M}"
     return p
 
@@ -126,7 +130,9 @@ def ensure_session(session, cwd):
 
 def launch(p, agents, dry, switch):
     s, d = p["session"], p["dir"]
-    if p["kind"] == "worktree":
+    if p["note"]:
+        print(f"  note: {p['note']}")
+    if p["worktree"]:
         argv = ["workmux", "add", p["branch"], "-a", p["agent"], "--parent-session", s]
         argv += ["--target-name", p["window"]] if p["window"] else []
         argv += [] if switch else ["-b"]
@@ -158,12 +164,16 @@ def short(path):
     return path.replace(HOME, "~", 1) if path.startswith(HOME) else path
 
 
+def cols(*c):
+    return f"{c[0]:<14} {c[1]:<14} {c[2]:<18} {c[3]:<8} {c[4]}"
+
+
 def pick(wfs):
     """fzf over the workflows. Returns (workflow, edit?) or None when cancelled."""
     rows = []
     for n, w in wfs.items():
-        model = w["model"] or ("-" if w["kind"] == "worktree" else "(default)")
-        rows.append(f"{n:<14} {w['agent']:<14} {model:<18} {short(os.path.expanduser(w['dir']))}")
+        model = "-" if w["worktree"] else (w["model"] or "(default)")
+        rows.append(cols(n, w["agent"], model, "yes" if w["worktree"] else "no", short(os.path.expanduser(w["dir"]))))
     # Columns are space-padded; two+ spaces end the first field, so --nth=1 matches the workflow
     # name only (typing "bet" must not fuzzy-match a path or agent column). --tiebreak=index: on a
     # tie YAML order wins, so typing "change" + Enter picks `change plan`, the first listed.
@@ -171,7 +181,7 @@ def pick(wfs):
         ["fzf", "--delimiter=\\s{2,}", "--nth=1", "--tiebreak=index", "--expect=tab", "--layout=reverse",
          "--info=hidden", "--prompt=workflow> ",
          "--header=enter: launch with defaults    tab: edit fields    esc: cancel\n"
-                   "workflow        agent          model              directory"],
+                   + cols("workflow", "agent", "model", "worktree", "directory")],
         input="\n".join(rows), text=True, stdout=subprocess.PIPE)
     if r.returncode in (1, 130):
         return None
@@ -196,7 +206,13 @@ def edit(wf, agents, o):
         if o["agent"] in agents:
             break
         print(f"  unknown agent '{o['agent']}'")
-    if wf["kind"] == "window":
+    while True:
+        answer = ask("new worktree? (y/n)", "y" if wf["worktree"] else "n").lower()
+        if answer in ("y", "yes", "n", "no"):
+            break
+        print("  answer y or n")
+    o["worktree"] = answer.startswith("y")
+    if not o["worktree"]:
         same = o["agent"] == wf["agent"]  # the workflow's model belongs to its own agent
         o["model"] = ask("model (empty = harness default)" if same else "model (agent changed: harness default)",
                          wf["model"] if same else "")
@@ -209,7 +225,8 @@ def edit(wf, agents, o):
 def run(args):
     agents, wfs = load()
     name = " ".join(args.workflow)
-    o = {"agent": args.agent, "model": args.model, "window": args.name, "dir": args.dir, "branch": args.branch}
+    o = {"agent": args.agent, "model": args.model, "window": args.name, "dir": args.dir, "branch": args.branch,
+         "worktree": args.worktree}
     if not name:
         chosen = pick(wfs)
         if chosen is None:
@@ -218,7 +235,8 @@ def run(args):
         if want_edit:
             print(f"\n  {name}: Enter keeps the [value], '-' clears it")
             edit(wfs[name], agents, o)
-        if wfs[name]["kind"] == "worktree" and not o["branch"]:
+        wants_worktree = wfs[name]["worktree"] if o["worktree"] is None else o["worktree"]
+        if wants_worktree and not o["branch"]:
             o["branch"] = ask("branch (required)")
     launch(make_plan(name, wfs, agents, o), agents, args.dry_run, not args.no_switch)
 
@@ -227,7 +245,9 @@ def main():
     ap = argparse.ArgumentParser(description="Start an agent window for a workflow (see module docstring).")
     ap.add_argument("workflow", nargs="*", help='e.g. change plan; omit to open the picker')
     ap.add_argument("--agent"), ap.add_argument("--model"), ap.add_argument("--name", help="window name")
-    ap.add_argument("--dir"), ap.add_argument("--branch", help="for worktree workflows")
+    ap.add_argument("--dir"), ap.add_argument("--branch", help="branch for a new worktree")
+    ap.add_argument("--worktree", action=argparse.BooleanOptionalAction, default=None,
+                    help="create a worktree (or not), overriding the workflow's default")
     ap.add_argument("--dry-run", action="store_true", help="print what would run, change nothing")
     ap.add_argument("--no-switch", action="store_true", help="leave the client where it is")
     args = ap.parse_args()
