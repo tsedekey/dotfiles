@@ -13,7 +13,8 @@ Personal macOS developer environment configuration. Extracted from a live setup 
 | `gh/` | GitHub CLI config (https protocol, `co` alias) |
 | `maven/` | `.mvn-flags.list` (flag definitions for Maven workflows) |
 | `asdf/` | `.tool-versions` (node version) |
-| `ghostty/` | `config` with Catppuccin Mocha theme, JetBrains Mono, shell integration |
+| `ghostty/` | `config` with Catppuccin Mocha theme, JetBrains Mono, shell integration, codepoint map for the agent-logo font |
+| `fonts/agent-icons/` | `AgentIcons.otf`: Claude, OpenCode and Copilot logos as glyphs (U+E400-E403) for the workmux sidebar; rebuild with `./build.py` (`--box` sets the size); sources are CC0 Simple Icons SVGs; `install.sh` copies it to `~/Library/Fonts` |
 | `Brewfile` | Core Homebrew tools (zsh, tmux, git, editors, dev tools, terminal) |
 
 ## Key tools

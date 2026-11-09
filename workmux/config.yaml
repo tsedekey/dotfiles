@@ -157,16 +157,20 @@ agents:
 # After editing this file run `touch -h ~/.config/workmux/config.yaml`: the sidebar's file watcher
 # only sees changes to the symlink itself, not to the dotfiles file behind it.
 #
-# Agent icons: workmux's defaults are letters (CC, CP, OC). Nerd Fonts 3.4.0 has NO Claude or OpenCode
-# brand glyph (checked in JetBrainsMono Nerd Font), so Claude uses the asterisk Claude Code itself shows
-# in session titles, Copilot its real Octicons logo, OpenCode a code-braces glyph. Written as \u escapes
-# so the codepoints stay visible. A bare string keeps the default colour; `{icon: ..., color: ...}`
-# would change it. Codepoints read from the font file: oct-copilot U+F4B8, md-code_braces U+F0169.
+# Agent icons: workmux's defaults are letters (CC, CP, OC) and no Nerd Font has a Claude or OpenCode
+# logo (checked in JetBrainsMono Nerd Font 3.4), so the real logos live in a tiny custom font,
+# AgentIcons (dotfiles/fonts/agent-icons/, copied to ~/Library/Fonts by install.sh). Ghostty maps
+# U+E400-E403 to it (font-codepoint-map in ghostty/config). A bare string keeps workmux's brand colour.
+#   U+E400 claude (starburst)   U+E401 claudecode (pixel mascot)   U+E402 opencode   U+E403 copilot
+# WHY THE TRAILING SPACE: the logos are two cells wide; a symbol followed by a space may spread over both
+# (Ghostty), and the space keeps workmux's {fill} alignment right. Copilot keeps its Nerd Font Octicons
+# glyph (U+F4B8, one cell); "\uE403 " is the same logo at the size of the other two.
+# Resize or re-draw: dotfiles/fonts/agent-icons/build.py (--box sets the size), then re-run install.sh.
 sidebar:
   agent_icons:
-    claude: "\u2733"        # ✳  eight-spoked asterisk (Claude Code's own marker)
+    claude: "\uE400 "       # AgentIcons: Claude starburst
     copilot: "\uF4B8"       # nf-oct-copilot
-    opencode: "\U000F0169"  # nf-md-code_braces
+    opencode: "\uE402 "     # AgentIcons: OpenCode block logo
   templates:
     compact: "{status_icon} {primary} {pane_suffix} {fill} {session} {agent_icon}"
     tiles:

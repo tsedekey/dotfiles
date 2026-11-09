@@ -4,6 +4,9 @@ theme = Catppuccin Mocha
 # Font
 font-family = JetBrainsMono Nerd Font
 font-size = 13
+# Agent logos for the workmux sidebar: Claude / OpenCode / Copilot marks live in a tiny
+# custom font at private-use U+E400-E403 (fonts/agent-icons/, installed by install.sh).
+font-codepoint-map = U+E400-U+E403=AgentIcons
 
 # Scrollback
 scrollback-limit = 10000
