@@ -144,3 +144,23 @@ agents:
       PLANNOTATOR_PLAN_REVIEW: "0"      # inert on pinned v0.28.51; honoured after an upgrade
       OPENCODE_PERMISSION: '{"*":"ask"}'
       OPENCODE_CONFIG_CONTENT: '{"enabled_providers":["openrouter"]}'
+
+# Sidebar tiles (workmux sidebar, `prefix B` toggles it). Each template line is one row of a tile; the
+# tile text area is only ~19 columns wide, `{fill}` splits a line into a left and a right part.
+# Added to the defaults: the tmux SESSION (change, epic, review, ...) and the AGENT (Claude, Copilot,
+# Opencode) on their own row, so they read the same for every window. `{secondary}` is not used: it is
+# a label chain (worktree / window / session / project) and means different things per window.
+#   row 1  window name ............ time since the agent's last status change
+#   row 2  tmux session ........... agent
+#   row 3  directory (project) .... git branch, uncommitted/committed diff stats
+#   row 4  agent session title .... PR number and checks
+# After editing this file run `touch -h ~/.config/workmux/config.yaml`: the sidebar's file watcher
+# only sees changes to the symlink itself, not to the dotfiles file behind it.
+sidebar:
+  templates:
+    compact: "{status_icon} {primary} {pane_suffix} {fill} {session} {agent_icon}"
+    tiles:
+      - "{primary} {pane_suffix} {fill} {elapsed}"
+      - "#[fg=cyan]{session}#[default] {fill} {agent_label}"
+      - "{project} {fill} {git_branch} {git_stats}"
+      - "{pane_title} {fill} {pr_number} {pr_checks}"
