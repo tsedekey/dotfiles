@@ -22,6 +22,8 @@
 #   window  window name; empty = "<last word of the workflow>-<HHMM>", e.g. plan-0712.
 #
 # Monitoring needs nothing here: every window is tracked by the agents' workmux hooks.
+# Exception: `general` runs the PERSONAL Claude profile, which has no workmux hooks (Eddie's choice,
+# 2026-11-09), so its windows do not show up in the sidebar.
 # Values marked (guess) were seeded without checking with Eddie; edit freely.
 
 workflows:
@@ -64,3 +66,7 @@ workflows:
   daily:                               # (guess) agent
     agent: claude
     dir: ~/.local/share/camunda/daily
+
+  general:                             # agent: Eddie (Claude on the personal profile); dir: (guess)
+    agent: claude-personal             # CLAUDE_CONFIG_DIR=~/.claude-personal, not ~/.claude. Not for work code.
+    dir: "~"                           # general purpose, not tied to a repo (quoted: a bare ~ is YAML null)
