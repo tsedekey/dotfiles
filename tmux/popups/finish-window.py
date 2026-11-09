@@ -74,25 +74,36 @@ def agent_status():
 
 
 def find_worktree(win):
-    """The non-main worktree this window works in, or None (plain window). Every pane is checked: an
-    agent pane that wandered into the main checkout must not hide the worktree next to it."""
+    """The linked (non-main) worktree this window works in, or None (plain window).
+
+    Plain git, a few ms per pane: `workmux list --json` runs git status in every worktree and takes
+    seconds in a big repo, which left the popup blank. In a linked worktree the git dir differs from
+    the common dir. Every pane is checked: an agent pane that wandered into the main checkout must
+    not hide the worktree next to it. Fallback: the window is named after a linked worktree."""
+    bare = re.sub(r"^[^A-Za-z0-9]+", "", win["name"])  # workmux prefixes an icon
+    main_roots = set()
     for p in win["panes"]:
         if p["cmd"] == "workmux":
             continue
-        rc, out, _ = run(["workmux", "list", "--json"], cwd=p["path"])
-        if rc:
+        rc, out, _ = run(["git", "rev-parse", "--show-toplevel", "--absolute-git-dir"], cwd=p["path"])
+        rc2, common, _ = run(["git", "rev-parse", "--path-format=absolute", "--git-common-dir"], cwd=p["path"])
+        if rc or rc2:
             continue
-        rows = json.loads(out)
-        top = run(["git", "rev-parse", "--show-toplevel"], cwd=p["path"])[1]
-        for r in rows:
-            if r["path"] == top:
-                if r["is_main"]:
-                    break  # this pane is in the main checkout; keep looking at the others
-                return r
-        bare = re.sub(r"^[^A-Za-z0-9]+", "", win["name"])  # workmux prefixes an icon
-        for r in rows:
-            if not r["is_main"] and r["handle"] == bare:
-                return r
+        top, gitdir = out.splitlines()
+        project = os.path.dirname(common)
+        if os.path.realpath(gitdir) != os.path.realpath(common):
+            branch = run(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=top)[1]
+            return {"handle": os.path.basename(top), "branch": "(detached)" if branch == "HEAD" else branch,
+                    "path": top, "project_path": project}
+        main_roots.add(project)
+    for project in main_roots:  # no pane is in a linked worktree; maybe the window is named after one
+        wts = run(["git", "worktree", "list", "--porcelain"], cwd=project)[1].split("\n\n")[1:]
+        for block in wts:
+            fields = dict(l.split(" ", 1) for l in block.splitlines() if " " in l)
+            path = fields.get("worktree", "")
+            if path and os.path.basename(path) == bare and os.path.isdir(path):
+                br = fields.get("branch", "(detached)").replace("refs/heads/", "")
+                return {"handle": bare, "branch": br, "path": path, "project_path": project}
     return None
 
 
@@ -140,6 +151,8 @@ def worktree_state(wt):
 
 
 def getkey():
+    """One raw keypress. tty.setraw flushes pending input (TCSAFLUSH) on purpose: a key typed while
+    the plan was still being worked out must never answer a question the user has not seen."""
     import termios
     import tty
     fd = os.open("/dev/tty", os.O_RDONLY)
@@ -197,6 +210,7 @@ def main():
         else:  # tmux does not expand formats in a popup command; the popup knows its origin pane
             pane = os.environ.get("TMUX_PANE")
             wid = tmux("display-message", "-p", *(["-t", pane] if pane else []), "#{window_id}")
+        print("\n  checking the window, git and the PR ...", flush=True)
         win = window_info(wid)
         title, lines, (argv, cwd), label = plan(win, agent_status())
         print(f"\n  {title}\n  " + "-" * len(title))
@@ -224,7 +238,10 @@ def main():
         cmd = (f"sleep 0.4; cd {shlex.quote(cwd)} && " if cwd else "sleep 0.4; ") + shlex.join(argv)
         cmd += f" || tmux display-message -d 8000 {shlex.quote('finish-window FAILED: ' + shlex.join(argv))}"
         subprocess.Popen(["tmux", "run-shell", "-b", cmd])
-    except Fail as e:
+    except Exception as e:  # Fail, or an unexpected crash: keep the message on screen either way
+        import traceback
+        if not isinstance(e, Fail):
+            traceback.print_exc()
         print(f"\033[31m  finish-window: {e}\033[0m", file=sys.stderr)
         if interactive:
             try:
