@@ -18,6 +18,7 @@ import argparse
 import datetime
 import os
 import re
+import select
 import shlex
 import subprocess
 import sys
@@ -128,15 +129,27 @@ def ensure_session(session, cwd):
         tmux("new-session", "-d", "-s", session, "-c", cwd)
 
 
-def launch(p, agents, dry, switch):
+def worktree_argv(p, switch):
+    argv = ["workmux", "add", p["branch"], "-a", p["agent"], "--parent-session", p["session"]]
+    argv += ["--target-name", p["window"]] if p["window"] else []
+    return argv + ([] if switch else ["-b"])
+
+
+def summary(p, agents, switch=True):
+    """What launch() is about to do, as text (shown before the confirmation and by --dry-run)."""
     s, d = p["session"], p["dir"]
-    if p["note"]:
-        print(f"  note: {p['note']}")
+    note = f"  note: {p['note']}\n" if p["note"] else ""
     if p["worktree"]:
-        argv = ["workmux", "add", p["branch"], "-a", p["agent"], "--parent-session", s]
-        argv += ["--target-name", p["window"]] if p["window"] else []
-        argv += [] if switch else ["-b"]
-        print(f"[{p['name']}] session {s} | cd {d} && {shlex.join(argv)}")
+        return note + f"[{p['name']}] session {s} | cd {d} && {shlex.join(worktree_argv(p, switch))}"
+    return note + f"[{p['name']}] session {s} | window {p['window']} | cd {d}\n  {agent_line(agents, p['agent'], p['model'])}"
+
+
+def launch(p, agents, dry, switch, show=True):
+    s, d = p["session"], p["dir"]
+    if show:
+        print(summary(p, agents, switch))
+    if p["worktree"]:
+        argv = worktree_argv(p, switch)
         if dry:
             return
         ensure_session(s, d)
@@ -147,7 +160,6 @@ def launch(p, agents, dry, switch):
             raise Fail(f"{shlex.join(argv)} exited {r.returncode}")
         return
     line = agent_line(agents, p["agent"], p["model"])
-    print(f"[{p['name']}] session {s} | window {p['window']} | cd {d}\n  {line}")
     if dry:
         return
     ensure_session(s, d)
@@ -191,13 +203,109 @@ def pick(wfs):
     return re.split(r"\s{2,}", chosen.strip())[0], key == "tab"
 
 
+class Cancelled(Exception):
+    """The user backed out (Esc, or Ctrl-D on an empty field). Nothing has been created yet: the
+    session and window only come into existence in launch(), after the last question."""
+
+
+def read_token(fd):
+    """One keypress: a character, or ENTER / ESC / BS / KILL_LINE / KILL_WORD / EOF / IGNORE.
+    A lone Esc is told apart from arrow and function keys (Esc [ ...) by waiting 50 ms for more."""
+    b = os.read(fd, 1)
+    if not b:
+        return "EOF"
+    c = b[0]
+    if c == 0x1B:
+        if select.select([fd], [], [], 0.05)[0]:
+            os.read(fd, 16)  # the rest of an arrow/function-key sequence
+            return "IGNORE"
+        return "ESC"
+    if c in (0x0D, 0x0A):
+        return "ENTER"
+    if c in (0x7F, 0x08):
+        return "BS"
+    if c == 0x15:
+        return "KILL_LINE"
+    if c == 0x17:
+        return "KILL_WORD"
+    if c == 0x04:
+        return "EOF"
+    if c < 0x20:
+        return "IGNORE"
+    extra = 0 if c < 0xC0 else 1 if c < 0xE0 else 2 if c < 0xF0 else 3  # UTF-8 continuation bytes
+    return (b + (os.read(fd, extra) if extra else b"")).decode(errors="ignore")
+
+
+def key_mode():
+    """cbreak: no echo and no line buffering, but Ctrl-C still raises KeyboardInterrupt."""
+    import contextlib
+    import termios
+    import tty
+
+    @contextlib.contextmanager
+    def mode():
+        fd = sys.stdin.fileno()
+        old = termios.tcgetattr(fd)
+        try:
+            tty.setcbreak(fd)
+            yield fd
+        finally:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old)
+    return mode()
+
+
 def ask(label, default=""):
     """`label [default]: ` -- Enter keeps the default, `-` clears it, anything else replaces it.
-    (No prefill: Python on macOS uses libedit, which ignores readline's startup hook.)"""
-    import readline  # noqa: F401  -- importing it gives input() line editing
+    Esc cancels (raises Cancelled). Own line editor: Python on macOS uses libedit, whose input()
+    can neither prefill nor treat Esc as cancel."""
     shown = f" [{default}]" if default else ""
-    answer = input(f"  {label}{shown}: ").strip()
+    sys.stdout.write(f"  {label}{shown}: ")
+    sys.stdout.flush()
+    if not sys.stdin.isatty():  # piped input (never the popup): plain line
+        answer = input().strip()
+    else:
+        text = ""
+        with key_mode() as fd:
+            while True:
+                t = read_token(fd)
+                if t == "ENTER":
+                    break
+                if t == "ESC" or (t == "EOF" and not text):
+                    raise Cancelled
+                if t == "BS" and text:
+                    text = text[:-1]
+                    sys.stdout.write("\b \b")
+                elif t in ("KILL_LINE", "KILL_WORD") and text:
+                    keep = "" if t == "KILL_LINE" else text.rstrip().rsplit(" ", 1)[0] + " " if " " in text.rstrip() else ""
+                    sys.stdout.write("\b \b" * (len(text) - len(keep)))
+                    text = keep
+                elif len(t) >= 1 and t not in ("ENTER", "ESC", "BS", "KILL_LINE", "KILL_WORD", "EOF", "IGNORE"):
+                    text += t
+                    sys.stdout.write(t)
+                sys.stdout.flush()
+        sys.stdout.write("\n")
+        answer = text.strip()
     return default if answer == "" else ("" if answer == "-" else answer)
+
+
+def confirm_launch():
+    """After the edit flow: Enter launches, any other key cancels."""
+    sys.stdout.write("\n  Enter = launch     Esc = cancel ")
+    sys.stdout.flush()
+    with key_mode() as fd:
+        t = read_token(fd)
+    sys.stdout.write("\n")
+    return t == "ENTER"
+
+
+def press_any_key():
+    sys.stdout.write("\n  press any key to close ")
+    sys.stdout.flush()
+    try:
+        with key_mode() as fd:
+            read_token(fd)
+    except Exception:
+        pass
 
 
 def edit(wf, agents, o):
@@ -233,11 +341,19 @@ def run(args):
             return
         name, want_edit = chosen
         if want_edit:
-            print(f"\n  {name}: Enter keeps the [value], '-' clears it")
+            print(f"\n  {name}:  Enter keeps the [value]   '-' clears it   Esc cancels")
             edit(wfs[name], agents, o)
         wants_worktree = wfs[name]["worktree"] if o["worktree"] is None else o["worktree"]
         if wants_worktree and not o["branch"]:
+            if not want_edit:
+                print(f"\n  {name}:  Esc cancels")
             o["branch"] = ask("branch (required)")
+        if want_edit:  # edited by hand: show the result and let the user back out before anything exists
+            plan = make_plan(name, wfs, agents, o)
+            print("\n" + summary(plan, agents, not args.no_switch))
+            if not confirm_launch():
+                raise Cancelled
+            return launch(plan, agents, args.dry_run, not args.no_switch, show=False)
     launch(make_plan(name, wfs, agents, o), agents, args.dry_run, not args.no_switch)
 
 
@@ -256,13 +372,11 @@ def main():
     except Fail as e:
         print(f"\033[31mlauncher: {e}\033[0m", file=sys.stderr)
         if not args.workflow:  # in the popup: keep the message on screen
-            try:
-                input("press Enter to close")
-            except (EOFError, KeyboardInterrupt):
-                pass
+            press_any_key()
         sys.exit(1)
-    except (KeyboardInterrupt, EOFError):
-        sys.exit(130)
+    except (Cancelled, KeyboardInterrupt, EOFError):
+        print("\n  cancelled, nothing created")
+        sys.exit(0)
 
 
 if __name__ == "__main__":
