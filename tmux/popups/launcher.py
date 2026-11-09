@@ -29,7 +29,7 @@ WORKFLOWS = os.environ.get("LAUNCHER_WORKFLOWS", f"{HOME}/dotfiles/workmux/workf
 AGENTS_CONFIG = os.environ.get("LAUNCHER_AGENTS_CONFIG", f"{HOME}/.config/workmux/config.yaml")
 KINDS = ("window", "worktree")
 FIELDS = {"kind", "session", "agent", "model", "dir", "window"}
-SPLIT = "20%"  # shell pane under the agent, like the pane layout in the workmux config
+SPLIT = "20%"  # shell pane BESIDE the agent (right), like workmux's `split: horizontal` layout
 
 
 class Fail(Exception):
@@ -149,7 +149,7 @@ def launch(p, agents, dry, switch):
                      "-t", f"={s}:", "-n", p["window"], "-c", d).split()
     tmux("send-keys", "-t", pane, "-l", line)
     tmux("send-keys", "-t", pane, "Enter")
-    tmux("split-window", "-v", "-d", "-l", SPLIT, "-t", pane, "-c", d)
+    tmux("split-window", "-h", "-d", "-l", SPLIT, "-t", pane, "-c", d)  # -h = side by side
     if switch:
         tmux("switch-client", "-t", win)
 

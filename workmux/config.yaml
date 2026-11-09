@@ -30,7 +30,8 @@ auto_update_check: false
 sandbox:
   enabled: false                        # keeps skip-permissions flags from ever being injected
 
-# Pane layout for new worktrees: the agent, plus a plain shell split below.
+# Pane layout for new worktrees: the agent, plus a plain shell BESIDE it (right). workmux's
+# `horizontal` split puts panes side by side, not stacked.
 panes:
   - command: <agent>
     focus: true
