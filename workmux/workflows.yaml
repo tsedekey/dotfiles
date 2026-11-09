@@ -22,8 +22,8 @@
 #   window  window name; empty = "<last word of the workflow>-<HHMM>", e.g. plan-0712.
 #
 # Monitoring needs nothing here: every window is tracked by the agents' workmux hooks.
-# Exception: `general` runs the PERSONAL Claude profile, which has no workmux hooks (Eddie's choice,
-# 2026-11-09), so its windows do not show up in the sidebar.
+# `general` runs the PERSONAL Claude profile (~/.claude-personal); its settings.json carries the same
+# workmux hooks as the work profile (added 2026-11-09), so those windows are tracked too.
 # Values marked (guess) were seeded without checking with Eddie; edit freely.
 
 workflows:
