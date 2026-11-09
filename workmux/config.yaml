@@ -163,13 +163,14 @@ agents:
 # U+E400-E403 to it (font-codepoint-map in ghostty/config). A bare string keeps workmux's brand colour.
 #   U+E400 claude (starburst)   U+E401 claudecode (pixel mascot)   U+E402 opencode   U+E403 copilot
 # WHY THE TRAILING SPACE: the logos are two cells wide; a symbol followed by a space may spread over both
-# (Ghostty), and the space keeps workmux's {fill} alignment right. Copilot keeps its Nerd Font Octicons
-# glyph (U+F4B8, one cell); "\uE403 " is the same logo at the size of the other two.
+# (Ghostty), and the space keeps workmux's {fill} alignment right. All three agents use the same
+# glyph + space shape so their left edges line up (the old one-cell Nerd Font Copilot glyph, U+F4B8,
+# sat one column to the right of the others).
 # Resize or re-draw: dotfiles/fonts/agent-icons/build.py (--box sets the size), then re-run install.sh.
 sidebar:
   agent_icons:
     claude: "\uE400 "       # AgentIcons: Claude starburst
-    copilot: "\uF4B8"       # nf-oct-copilot
+    copilot: "\uE403 "     # AgentIcons: Copilot logo
     opencode: "\uE402 "     # AgentIcons: OpenCode block logo
   templates:
     compact: "{status_icon} {primary} {pane_suffix} {fill} {session} {agent_icon}"

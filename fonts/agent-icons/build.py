@@ -99,7 +99,8 @@ def build(box: int, cells: int, out: Path) -> None:
                        "licenseDescription": "Logo shapes from Simple Icons (CC0 1.0). "
                                              "Claude, OpenCode and GitHub Copilot marks are trademarks of their owners."})
     fb.setupOS2(version=4, sTypoAscender=ASCENT, sTypoDescender=DESCENT, sTypoLineGap=0,
-                usWinAscent=ASCENT, usWinDescent=-DESCENT, fsSelection=0x40 | 0x80)
+                usWinAscent=ASCENT, usWinDescent=-DESCENT, sxHeight=550, sCapHeight=730,
+                fsSelection=0x40 | 0x80)
     fb.setupPost()
     fb.save(out)
     print(f"wrote {out} ({out.stat().st_size} bytes): box={box} units, advance={advance} ({cells} cells)")
