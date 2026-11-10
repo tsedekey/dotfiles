@@ -1,0 +1,30 @@
+# Yazi theme — follows the Ghostty theme (Catppuccin Mocha, translucent background).
+#
+# Ghostty applies background-opacity and blur only to cells with the *default*
+# background, so any explicit bg painted here renders opaque and shows up as a
+# mismatched strip. The status bar body and the _alt badges therefore set no bg
+# and inherit the terminal's. The _main badges keep their colour on purpose.
+# Keys verified against Yazi 26.x schema.
+
+# Mode indicators (bottom-left badges)
+[mode]
+normal_main = { fg = "darkgray", bg = "blue",        bold = true }
+normal_alt  = { fg = "blue" }
+select_main = { fg = "black", bg = "brightyellow",   bold = true }
+select_alt  = { fg = "brightyellow" }
+unset_main  = { fg = "black", bg = "lightmagenta",   bold = true }
+unset_alt   = { fg = "lightmagenta" }
+
+# Status bar body — no bg, so the terminal background shows through
+[status]
+overall        = { fg = "white" }
+sep_left       = { open = "", close = "" }
+sep_right      = { open = "", close = "" }
+perm_type      = { fg = "lightgreen" }
+perm_read      = { fg = "lightyellow" }
+perm_write     = { fg = "lightred" }
+perm_exec      = { fg = "lightcyan" }
+perm_sep       = { fg = "darkgray" }
+progress_label = { fg = "white",  bold = true }
+progress_normal = { fg = "cyan" }
+progress_error  = { fg = "lightred" }

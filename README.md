@@ -14,6 +14,7 @@ Personal macOS developer environment configuration. Extracted from a live setup 
 | `maven/` | `.mvn-flags.list` (flag definitions for Maven workflows) |
 | `asdf/` | `.tool-versions` (node version) |
 | `ghostty/` | `config` with Catppuccin Mocha theme, JetBrains Mono, shell integration, codepoint map for the agent-logo font |
+| `yazi/` | `theme.toml` that follows the Ghostty theme: status bar and `_alt` badges set no background, so Ghostty's opacity and blur show through |
 | `fonts/agent-icons/` | `AgentIcons.otf`: Claude, OpenCode and Copilot logos as glyphs (U+E400-E403) for the workmux sidebar; rebuild with `./build.py` (`--box` sets the size); sources are CC0 Simple Icons SVGs; `install.sh` copies it to `~/Library/Fonts` |
 | `Brewfile` | Core Homebrew tools (zsh, tmux, git, editors, dev tools, terminal) |
 

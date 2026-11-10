@@ -94,6 +94,11 @@ info "Ghostty configuration"
 link_file "$DOTFILES_DIR/ghostty/config"       "$HOME/.config/ghostty/config"
 echo ""
 
+# --- Yazi ---
+info "Yazi configuration"
+link_file "$DOTFILES_DIR/yazi/theme.toml"      "$HOME/.config/yazi/theme.toml"
+echo ""
+
 # --- Agent icon font (Claude / OpenCode logos for the workmux sidebar) ---
 # Copied, not symlinked: CoreText is not guaranteed to follow symlinks in ~/Library/Fonts.
 # Ghostty maps U+E400-E403 to it (font-codepoint-map in ghostty/config). Rebuild with
