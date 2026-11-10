@@ -65,11 +65,11 @@ workflows:
     repo: ~/dev/camunda/camunda
     files: ~/.local/share/camunda/dagrunner
 
-  epic:                                # Claude, not Copilot: define-companion needs Slack and Glean
+  epic:                                # Claude, not Copilot: epic-companion needs Slack and Glean
     agent: claude
     model: claude-sonnet-5-5           # Claude ids are hyphenated (Copilot's are claude-sonnet-5.5)
-    skill: define-companion            # -> epic-companion
-    files: ~/.local/share/camunda/feature-work-companion/epics    # <epic-slug>/
+    skill: epic-companion
+    files: ~/.local/share/camunda/epic-companion    # <epic-slug>/
     case_label: epic-slug
     ask: [case, repo]                  # repo = the epic's docs repo (differs per epic; Tab lists ~/dev/camunda)
 
