@@ -21,7 +21,9 @@
 #           exist (a typo should fail, not create a stray tree). The right-hand shell pane opens in
 #           <files>/<case>, and the agent starts there when there is no repo.
 #   case    default case name: one folder under `files` (PR number, issue-slug, a date...). `{date}` =
-#           today. The launcher creates the folder; the skill finds it and resumes from its checkpoint.
+#           today; `{latest:N}` = the newest YYYY-MM-DD folder less than N days old (a shift or duty that
+#           is still running: resume it), otherwise today (start a new one). The launcher creates the
+#           folder; the skill finds it and resumes from its checkpoint.
 #           Empty = no default; with `ask: [case]` the Enter flow asks for it (Tab lists existing cases).
 #   case_label  what the prompt calls the case ("PR number").
 #   ask     fields the plain Enter flow asks for: case, repo. (The Tab flow always asks for everything.)
@@ -99,9 +101,9 @@ workflows:
 
   medic:                               # one folder per shift, named by its start date
     agent: claude
-    skill: core-features-medic-companion    # -> medic-companion
+    skill: medic-companion
     files: ~/.local/share/camunda/medic-companion
-    case: "{date}"                     # new shift = today; Tab lists earlier shifts to resume
+    case: "{latest:7}"                 # resume the shift started in the last 7 days, else today; Tab lists shifts
     case_label: shift start date
     ask: [case]
 

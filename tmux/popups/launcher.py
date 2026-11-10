@@ -53,8 +53,23 @@ def norm(path):
     return os.path.normpath(os.path.expanduser(path)) if path else ""
 
 
-def expand_case(case):
-    return (case or "").replace("{date}", f"{datetime.date.today():%Y-%m-%d}")
+def expand_case(case, root=""):
+    """`{date}` = today. `{latest:N}` = the newest YYYY-MM-DD folder under root that is less than N days
+    old (a shift or duty that is still running: resume it), otherwise today (start a new one)."""
+    today = datetime.date.today()
+    case = (case or "").replace("{date}", f"{today:%Y-%m-%d}")
+    m = re.fullmatch(r"\{latest:(\d+)\}", case)
+    if m:
+        newest = ""
+        for name in list_names(root):
+            try:
+                age = (today - datetime.date.fromisoformat(name)).days
+            except ValueError:
+                continue  # not a date folder
+            if 0 <= age < int(m[1]) and name > newest:
+                newest = name
+        case = newest or f"{today:%Y-%m-%d}"
+    return case
 
 
 def clean_case(case):
@@ -174,7 +189,7 @@ def make_plan(name, wfs, agents, o):
         raise Fail(f"files folder does not exist: {p['files']} (create it, or fix `files:`; only the case folder is created for you)")
     if not (p["repo"] or p["files"]):
         raise Fail("needs a repo, a files folder, or both")
-    case = clean_case(expand_case(o["case"] if o.get("case") is not None else wf["case"]))
+    case = clean_case(expand_case(o["case"] if o.get("case") is not None else wf["case"], p["files"]))
     if case and not p["files"]:
         raise Fail("a case needs a files folder to live in")
     p["case"] = case
@@ -583,7 +598,7 @@ def quick(wf, o):
     """The plain Enter flow: only the fields the workflow marks `ask:` (its case, maybe its repo)."""
     for key in wf["ask"]:
         if key == "case":
-            o["case"] = ask(wf["case_label"] + " (empty = none)", expand_case(wf["case"]),
+            o["case"] = ask(wf["case_label"] + " (empty = none)", expand_case(wf["case"], files_root(wf, o)),
                             names_completer(files_root(wf, o), newest=True))
         elif key == "repo":
             o["repo"] = ask("repo (empty = none)", wf["repo"], path_completer)
@@ -619,7 +634,7 @@ def edit(wf, agents, o):
     else:
         o["window"] = ask("window name (empty = branch name)", wf["window"])
     o["files"] = ask("files folder (empty = none)", wf["files"], path_completer)
-    o["case"] = ask(wf["case_label"] + " (empty = none)", expand_case(wf["case"]),
+    o["case"] = ask(wf["case_label"] + " (empty = none)", expand_case(wf["case"], norm(o["files"])),
                     names_completer(norm(o["files"]), newest=True))
 
 
