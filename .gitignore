@@ -32,3 +32,5 @@ nvim/lazy-lock.json
 
 # Caches
 .cache/
+__pycache__/
+*.pyc
