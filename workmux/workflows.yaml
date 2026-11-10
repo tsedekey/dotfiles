@@ -92,8 +92,8 @@ workflows:
 
   assess:
     agent: claude
-    skill: cve-assessment-companion    # -> assess-companion
-    files: ~/.local/share/camunda/cve-companion/cases    # <CVE-ID>/
+    skill: assess-companion
+    files: ~/.local/share/camunda/assess-companion/cases    # <CVE-ID>/
     case_label: CVE ID
     ask: [case]
 
