@@ -35,7 +35,7 @@
 #   session   tmux session; default = the first word of the workflow name.
 #   window    window name; empty = "<last word of the workflow>-<case>", or -<HHMM> without a case.
 #   hidden    true = not in the popup; only reachable by name from the CLI (another agent starts it:
-#             launcher.py dagrunner --branch X --prompt "/dagrunner-driver <plan>").
+#             launcher.py dagrunner --branch X --prompt "/dagrunner-companion <plan>").
 #
 # Monitoring needs nothing here: every window is tracked by the agents' workmux hooks.
 # `general` runs the PERSONAL Claude profile (~/.claude-personal); its settings.json carries the same
@@ -50,9 +50,9 @@ workflows:
   change:                              # plan stage: Copilot in the main checkout, no worktree
     agent: copilot
     model: claude-sonnet-5.5
-    skill: change-work-companion       # -> change-companion
+    skill: change-companion
     repo: ~/dev/camunda/camunda        # worktree off it is optional (Tab flow)
-    files: ~/.local/share/camunda/change-work    # <issue>-<slug>/
+    files: ~/.local/share/camunda/change-companion    # <issue>-<slug>/
     case_label: issue-slug
     ask: [case]
 
@@ -61,7 +61,7 @@ workflows:
     session: change                    # same session and sidebar group as the plan that started it
     worktree: true
     agent: claude-driver
-    skill: dagrunner-driver            # -> dagrunner-companion
+    skill: dagrunner-companion
     repo: ~/dev/camunda/camunda
     files: ~/.local/share/camunda/dagrunner
 

@@ -69,7 +69,7 @@ agents:
   # hooks, acceptEdits, deny rules, MCP servers). `--setting-sources user` keeps all of that,
   # and the repo's project CLAUDE.md, out of THIS session (checked 2026-11-08 in a scratch
   # project: project hooks, permission mode, commands and CLAUDE.md all stop loading).
-  # User-level skills (dagrunner-driver) and the workmux status hooks in ~/.claude/settings.json
+  # User-level skills (dagrunner-companion) and the workmux status hooks in ~/.claude/settings.json
   # still load. Same bypass default as `claude`; use for dagrunner runs only:
   #   wm add <branch> -a claude-driver
   claude-driver:
