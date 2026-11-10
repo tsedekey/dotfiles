@@ -84,8 +84,8 @@ workflows:
 
   investigate:
     agent: claude
-    skill: investigation-companion     # -> investigate-companion
-    files: ~/.local/share/camunda/investigation-companion/cases    # <incident number>/
+    skill: investigate-companion
+    files: ~/.local/share/camunda/investigate-companion/cases    # <incident number>/
     case_label: incident
     ask: [case]
     extra_dirs: [~/dev/camunda/camunda]
