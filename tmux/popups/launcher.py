@@ -25,6 +25,7 @@ Env: LAUNCHER_WORKFLOWS / LAUNCHER_AGENTS_CONFIG override the two config paths (
 """
 import argparse
 import datetime
+import json
 import os
 import re
 import select
@@ -109,6 +110,20 @@ def check_skill(agents, agent, skill, where):
     roots = skill_roots(agents[agent])
     if not any(os.path.isfile(os.path.join(r, skill, "SKILL.md")) for r in roots):
         raise Fail(f"{where}: skill '{skill}' is not installed for agent '{agent}' (looked in {', '.join(roots)})")
+
+
+def skill_switched_off(a, skill):
+    """The settings file that switches this Claude skill off, or None. `skillOverrides: {skill: off}` in the
+    profile's settings.json makes a typed /skill print "disabled via skillOverrides" and start nothing
+    (tested 2026-11-10); `user-invocable-only` hides it from the model but still lets /skill run."""
+    if not skill or agent_kind(a) != "claude":
+        return None
+    path = os.path.join((a.get("env") or {}).get("CLAUDE_CONFIG_DIR", f"{HOME}/.claude"), "settings.json")
+    try:
+        with open(path) as f:
+            return path if (json.load(f).get("skillOverrides") or {}).get(skill) == "off" else None
+    except (OSError, ValueError, AttributeError):
+        return None
 
 
 def load():
@@ -224,6 +239,11 @@ def make_plan(name, wfs, agents, o):
         prompt = o["prompt"]
     else:
         prompt = f"/{p['skill']}" + (f" {case}" if case else "") if p["skill"] else ""
+    off = skill_switched_off(agents[p["agent"]], p["skill"]) if prompt.startswith(f"/{p['skill']}") else None
+    if off:
+        raise Fail(f"skill '{p['skill']}' is switched off in skillOverrides ({short(off)}), so the session would "
+                   f"start and only print an error. Remove that entry, or set it to \"user-invocable-only\" "
+                   f"(hidden from the model, still runs when typed).")
     if prompt and kind == "other":
         notes.append(f"agent '{p['agent']}' cannot take a first prompt: type it yourself: {prompt}")
         prompt = ""

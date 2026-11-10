@@ -109,9 +109,9 @@ workflows:
 
   release:                             # one folder per release duty (about 4 weeks), named by its start date
     agent: claude
-    skill: optimize-patch-release      # -> release-companion
+    skill: release-companion
     files: ~/.local/share/camunda/release-companion
-    case: "{date}"                     # new duty = today; Tab lists earlier duties to resume
+    case: "{latest:28}"                # resume the duty started in the last 28 days, else today; Tab lists duties
     case_label: duty start date
     ask: [case]
     extra_dirs: [~/dev/camunda/camunda]    # (guess) the skill's steps run git in the code checkout
