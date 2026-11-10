@@ -17,7 +17,7 @@
 #           Empty = no first prompt.
 #   repo    the git repo the agent works in. It starts there, and a worktree (below) branches off it.
 #           Empty = no repo: the agent starts in the case folder.
-#   files   the folder that holds this workflow's cases, e.g. .../pr-review-companion/cases. Must
+#   files   the folder that holds this workflow's cases, e.g. .../review-companion/cases. Must
 #           exist (a typo should fail, not create a stray tree). The right-hand shell pane opens in
 #           <files>/<case>, and the agent starts there when there is no repo.
 #   case    default case name: one folder under `files` (PR number, issue-slug, a date...). `{date}` =
@@ -76,8 +76,8 @@ workflows:
   review:                              # reads the PR; no code to change, so it starts in its case folder
     agent: copilot
     model: claude-sonnet-5.5
-    skill: pr-review-companion         # -> review-companion
-    files: ~/.local/share/camunda/pr-review-companion/cases    # <PR number>/
+    skill: review-companion
+    files: ~/.local/share/camunda/review-companion/cases    # <PR number>/
     case_label: PR number
     ask: [case]
     extra_dirs: [~/dev/camunda/camunda]
