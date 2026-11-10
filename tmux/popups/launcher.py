@@ -41,7 +41,7 @@ AGENTS_CONFIG = os.environ.get("LAUNCHER_AGENTS_CONFIG", f"{HOME}/.config/workmu
 FIELDS = {"worktree", "session", "agent", "model", "skill", "repo", "files", "case", "case_label",
           "ask", "extra_dirs", "hidden", "window"}
 ASKABLE = {"case", "repo"}  # fields a workflow can make the plain Enter flow ask for
-SPLIT = "20%"  # shell pane BESIDE the agent (right), like workmux's `split: horizontal` layout
+SPLIT = "30%"  # shell pane BESIDE the agent (right), like workmux's `split: horizontal` layout; was 20%, widened by half
 
 
 class Fail(Exception):

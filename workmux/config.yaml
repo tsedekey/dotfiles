@@ -36,7 +36,7 @@ panes:
   - command: <agent>
     focus: true
   - split: horizontal
-    size: 20
+    size: 30                            # columns (workmux `size` is absolute); was 20, widened by half 2026-11-10
 
 agents:
   # Work Claude profile. Default = full bypass.
@@ -147,13 +147,16 @@ agents:
 
 # Sidebar tiles (workmux sidebar, `prefix B` toggles it). Each template line is one row of a tile; the
 # tile text area is only ~19 columns wide, `{fill}` splits a line into a left and a right part.
-# Added to the defaults: the tmux SESSION (change, epic, review, ...) and the AGENT's icon on their own
-# row, so they read the same for every window. `{secondary}` is not used: it is a label chain
+# Streamlined 2026-11-10: the tmux SESSION, the DIRECTORY and the GIT BRANCH are left out of the tiles on
+# purpose, because they repeat what is already on screen (the section header above a tile is the session,
+# the tmux status bar shows it too, and the directory and branch are visible inside the agent window).
+# Everything else stays: elapsed time, diff stats, PR number and checks. To bring one back, add
+# {session}, {project} or {git_branch} to a row. `{secondary}` stays unused: it is a label chain
 # (worktree / window / session / project) and means different things per window.
-#   row 1  window name ............ time since the agent's last status change
-#   row 2  tmux session ........... agent icon (colour = the agent's default brand colour)
-#   row 3  directory (project) .... git branch, uncommitted/committed diff stats
-#   row 4  agent session title .... PR number and checks
+#   row 1  window name ............ agent icon (colour = the agent's default brand colour)
+#   row 2  agent session title
+#   row 3  (blank on the left) .... uncommitted/committed diff stats
+#   row 4  time since the agent's last status change ... PR number and checks
 # After editing this file run `touch -h ~/.config/workmux/config.yaml`: the sidebar's file watcher
 # only sees changes to the symlink itself, not to the dotfiles file behind it.
 #
@@ -177,9 +180,9 @@ sidebar:
     copilot: "\uE403 "     # AgentIcons: Copilot logo
     opencode: "\uE402 "     # AgentIcons: OpenCode block logo
   templates:
-    compact: "{status_icon} {primary} {pane_suffix} {fill} {session} {agent_icon}"
+    compact: "{status_icon} {primary} {pane_suffix} {fill} {agent_icon}"
     tiles:
-      - "{primary} {pane_suffix} {fill} {elapsed}"
-      - "#[fg=cyan]{session}#[default] {fill} {agent_icon}"
-      - "{project} {fill} {git_branch} {git_stats}"
-      - "{pane_title} {fill} {pr_number} {pr_checks}"
+      - "{primary} {pane_suffix} {fill} {agent_icon}"
+      - "{pane_title}"
+      - "{fill} {git_stats}"
+      - "{elapsed} {fill} {pr_number} {pr_checks}"
