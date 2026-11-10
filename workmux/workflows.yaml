@@ -1,72 +1,126 @@
 # Defaults for the workflow launcher (tmux/popups/launcher.py, tmux prefix + N).
 #
 # One entry per workflow. The key is what you pick in the popup; the FIRST WORD is the tmux
-# session ("change plan" and "change run" both live in session `change`) unless `session:` is set.
-# Pressing Enter on a workflow launches with exactly these values; Tab lets you edit them first.
-# Typing filters by workflow name only; on a tie the FIRST listed wins, so "change" + Enter
-# picks `change plan`. Keep the workflow you launch most often above its siblings.
+# session unless `session:` is set. Pressing Enter on a workflow launches with exactly these values
+# (plus whatever the workflow `ask:`s for); Tab lets you edit every field first. Typing filters by
+# workflow name only; on a tie the FIRST listed wins. Keep the workflow you launch most often above
+# its siblings.
 #
-#   worktree  false (default)  a plain tmux window in `dir`; the agent is typed into its shell. No git
-#                              repo needed, so workspaces under ~/.local/share/camunda work. Plans,
-#                              reviews, investigations, assessments, medic, release and daily start
-#                              here: read-only work can fetch a branch without a worktree.
-#             true             first creates a worktree: `workmux add <branch> -a <agent>
-#                              --parent-session <session>`, run from `dir` (a git repo). Asks for the
-#                              branch. Only for work that changes code (change run). The Tab flow in
-#                              the popup can switch it on or off for a single launch.
+# A workflow is: an agent, a skill, and the places it works in.
+#
 #   agent   a name from `agents:` in ~/.config/workmux/config.yaml (env, args and command come from
 #           there, so profiles never drift). Typos are a load error, not a runtime surprise.
 #   model   passed as `--model <model>`; empty = the harness' own default. workmux add has no model
 #           flag, so with a worktree the default is ignored (with a note) and an explicit --model errors.
-#   dir     working directory of the agent (~ expanded). Must exist.
-#   window  window name; empty = "<last word of the workflow>-<HHMM>", e.g. plan-0712.
+#   skill   started as the agent's first prompt: `/<skill> <case>`. Must be installed for that agent
+#           (Claude: ~/.claude/skills, Copilot: ~/.copilot/skills), otherwise it is a load error.
+#           Empty = no first prompt.
+#   repo    the git repo the agent works in. It starts there, and a worktree (below) branches off it.
+#           Empty = no repo: the agent starts in the case folder.
+#   files   the folder that holds this workflow's cases, e.g. .../pr-review-companion/cases. Must
+#           exist (a typo should fail, not create a stray tree). The right-hand shell pane opens in
+#           <files>/<case>, and the agent starts there when there is no repo.
+#   case    default case name: one folder under `files` (PR number, issue-slug, a date...). `{date}` =
+#           today. The launcher creates the folder; the skill finds it and resumes from its checkpoint.
+#           Empty = no default; with `ask: [case]` the Enter flow asks for it (Tab lists existing cases).
+#   case_label  what the prompt calls the case ("PR number").
+#   ask     fields the plain Enter flow asks for: case, repo. (The Tab flow always asks for everything.)
+#   worktree  false (default)  a plain tmux window; the agent is typed into its shell. No git needed.
+#             true             first creates a worktree: `workmux add <branch> -a <agent> --parent-session
+#                              <session>`, run from `repo`. Asks for the branch. The Tab flow can switch it
+#                              on or off for a single launch whenever a repo is set. workmux opens its own
+#                              shell pane in the worktree; the launcher moves it to the case folder.
+#   extra_dirs  more folders the agent may use (--add-dir), e.g. the code checkout for a workflow that
+#               starts in its case folder. Not passed for worktrees (workmux builds that command).
+#   session   tmux session; default = the first word of the workflow name.
+#   window    window name; empty = "<last word of the workflow>-<case>", or -<HHMM> without a case.
+#   hidden    true = not in the popup; only reachable by name from the CLI (another agent starts it:
+#             launcher.py dagrunner --branch X --prompt "/dagrunner-driver <plan>").
 #
 # Monitoring needs nothing here: every window is tracked by the agents' workmux hooks.
 # `general` runs the PERSONAL Claude profile (~/.claude-personal); its settings.json carries the same
 # workmux hooks as the work profile (added 2026-11-09), so those windows are tracked too.
+#
+# Names below are TODAY's skill and folder names. Each workflow is renamed on its own turn (skill, folder,
+# the skill's hardcoded paths, pointers in CLAUDE.md): see the realignment notes. medic, release and
+# general had no folder yet, so they already use their final ones.
 # Values marked (guess) were seeded without checking with Eddie; edit freely.
 
 workflows:
-  change plan:
+  change:                              # plan stage: Copilot in the main checkout, no worktree
     agent: copilot
     model: claude-sonnet-5.5
-    dir: ~/dev/camunda/camunda        # main checkout, no worktree (plan stage)
+    skill: change-work-companion       # -> change-companion
+    repo: ~/dev/camunda/camunda        # worktree off it is optional (Tab flow)
+    files: ~/.local/share/camunda/change-work    # <issue>-<slug>/
+    case_label: issue-slug
+    ask: [case]
 
-  change run:
-    worktree: true                    # the only workflow that changes code, so the only worktree
+  dagrunner:                           # the run stage; started BY the change session on the DagRunner path
+    hidden: true
+    session: change                    # same session and sidebar group as the plan that started it
+    worktree: true
     agent: claude-driver
-    dir: ~/dev/camunda/camunda        # repo `workmux add` runs from; asks for the branch
+    skill: dagrunner-driver            # -> dagrunner-companion
+    repo: ~/dev/camunda/camunda
+    files: ~/.local/share/camunda/dagrunner
 
-  epic:                                # agent + model: Eddie; dir: where define-companion keeps epics
-    agent: claude                      # discovery, define, task breakdown: thinking work, no worktree
+  epic:                                # Claude, not Copilot: define-companion needs Slack and Glean
+    agent: claude
     model: claude-sonnet-5-5           # Claude ids are hyphenated (Copilot's are claude-sonnet-5.5)
-    dir: ~/.local/share/camunda/feature-work-companion/epics   # epics/<epic-slug>/ per epic
+    skill: define-companion            # -> epic-companion
+    files: ~/.local/share/camunda/feature-work-companion/epics    # <epic-slug>/
+    case_label: epic-slug
+    ask: [case, repo]                  # repo = the epic's docs repo (differs per epic; Tab lists ~/dev/camunda)
 
-  review:                              # (guess) agent, model
+  review:                              # reads the PR; no code to change, so it starts in its case folder
     agent: copilot
     model: claude-sonnet-5.5
-    dir: ~/dev/camunda/camunda
+    skill: pr-review-companion         # -> review-companion
+    files: ~/.local/share/camunda/pr-review-companion/cases    # <PR number>/
+    case_label: PR number
+    ask: [case]
+    extra_dirs: [~/dev/camunda/camunda]
 
-  investigate:                         # (guess) agent, dir
+  investigate:
     agent: claude
-    dir: ~/dev/camunda/camunda
+    skill: investigation-companion     # -> investigate-companion
+    files: ~/.local/share/camunda/investigation-companion/cases    # <incident number>/
+    case_label: incident
+    ask: [case]
+    extra_dirs: [~/dev/camunda/camunda]
 
-  assess:                              # (guess) agent, dir
+  assess:
     agent: claude
-    dir: ~/.local/share/camunda/cve-companion
+    skill: cve-assessment-companion    # -> assess-companion
+    files: ~/.local/share/camunda/cve-companion/cases    # <CVE-ID>/
+    case_label: CVE ID
+    ask: [case]
 
-  medic:                               # (guess) agent, dir
+  medic:                               # one folder per shift, named by its start date
     agent: claude
-    dir: ~/dev/camunda/camunda
+    skill: core-features-medic-companion    # -> medic-companion
+    files: ~/.local/share/camunda/medic-companion
+    case: "{date}"                     # new shift = today; Tab lists earlier shifts to resume
+    case_label: shift start date
+    ask: [case]
 
-  release:                             # (guess) agent, dir
+  release:                             # one folder per release duty (about 4 weeks), named by its start date
     agent: claude
-    dir: ~/dev/camunda/camunda
+    skill: optimize-patch-release      # -> release-companion
+    files: ~/.local/share/camunda/release-companion
+    case: "{date}"                     # new duty = today; Tab lists earlier duties to resume
+    case_label: duty start date
+    ask: [case]
+    extra_dirs: [~/dev/camunda/camunda]    # (guess) the skill's steps run git in the code checkout
 
-  daily:                               # (guess) agent
+  daily:
     agent: claude
-    dir: ~/.local/share/camunda/daily
+    skill: daily-companion
+    files: ~/.local/share/camunda/daily    # -> daily-companion
 
-  general:                             # agent: Eddie (Claude on the personal profile); dir: (guess)
-    agent: claude-personal             # CLAUDE_CONFIG_DIR=~/.claude-personal, not ~/.claude. Not for work code.
-    dir: "~"                           # general purpose, not tied to a repo (quoted: a bare ~ is YAML null)
+  general:                             # Claude on the personal profile. Not for work code.
+    agent: claude-personal             # CLAUDE_CONFIG_DIR=~/.claude-personal, not ~/.claude
+    files: ~/.local/share/general      # <session name>/ ; outside ~/.local/share/camunda: personal, not work
+    case_label: session name
+    ask: [case]
