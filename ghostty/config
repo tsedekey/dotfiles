@@ -1,5 +1,6 @@
 # Theme — Catppuccin Mocha (matches tmux)
 theme = Catppuccin Mocha
+background = #11111b
 
 # Font
 font-family = JetBrainsMono Nerd Font
@@ -15,7 +16,7 @@ scrollback-limit = 10000
 macos-titlebar-style = hidden
 window-padding-x = 8
 window-padding-y = 4
-background-opacity = 0.95
+background-opacity = 0.85
 background-blur-radius = 20
 
 # Cursor
