@@ -117,7 +117,7 @@ workflows:
   daily:
     agent: claude
     skill: daily-companion
-    files: ~/.local/share/camunda/daily    # -> daily-companion
+    files: ~/.local/share/camunda/daily-companion
 
   general:                             # Claude on the personal profile. Not for work code.
     agent: claude-personal             # CLAUDE_CONFIG_DIR=~/.claude-personal, not ~/.claude
