@@ -159,3 +159,6 @@ wmc() {
 }
 
 eval "$(atuin init zsh)"
+
+# The next line updates PATH for egcli command.
+if [ -f '/Users/eddie.tsedeke/Library/Group Containers/FELUD555VC.group.com.egnyte.DesktopApp/CLI/egcli.inc' ]; then . '/Users/eddie.tsedeke/Library/Group Containers/FELUD555VC.group.com.egnyte.DesktopApp/CLI/egcli.inc'; fi
