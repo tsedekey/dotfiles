@@ -16,6 +16,11 @@ A workflow is five things (defaults in dotfiles/workmux/workflows.yaml, explaine
   files + case    where the session's artifacts live: <files>/<case>/. The right-hand shell pane opens
                   there. The launcher creates the case folder; the files root must already exist
   extra_dirs      more folders the agent may read (passed as --add-dir)
+The case is the one value you type, and where a workflow has a `key:` (GitHub issue or PR, incident.io
+ref, CVE ID) it is a KEY: the case folder, the window (<workflow>-<key>) and the skill's argument are all
+that same value, and a pasted URL or a wrong-case spelling is turned into the canonical one (normalize_key).
+The epic workflow is the exception: it asks WHICH epic first (`workspaces:`, the one launched last is offered),
+and the key is a task issue of that epic; the task has no folder of its own (see workflows.yaml).
 The agent starts in the repo (or its new worktree) when there is one, otherwise in the case folder.
 The session is the workflow's first word and is created when missing.  Every window is monitored
 because the agents' own workmux hooks register the pane; nothing here talks to workmux except
@@ -38,9 +43,9 @@ HOME = os.path.expanduser("~")
 os.environ["PATH"] = f"{HOME}/.local/bin:/opt/homebrew/bin:{os.environ.get('PATH', '')}"
 WORKFLOWS = os.environ.get("LAUNCHER_WORKFLOWS", f"{HOME}/dotfiles/workmux/workflows.yaml")
 AGENTS_CONFIG = os.environ.get("LAUNCHER_AGENTS_CONFIG", f"{HOME}/.config/workmux/config.yaml")
-FIELDS = {"worktree", "session", "agent", "model", "skill", "repo", "files", "case", "case_label",
-          "ask", "extra_dirs", "hidden", "window"}
-ASKABLE = {"case", "repo"}  # fields a workflow can make the plain Enter flow ask for
+FIELDS = {"worktree", "session", "agent", "model", "skill", "repo", "files", "workspaces", "case", "case_label",
+          "key", "ask", "extra_dirs", "hidden", "window"}
+ASKABLE = {"epic", "case", "repo"}  # fields a workflow can make the plain Enter flow ask for
 SPLIT = "30%"  # shell pane BESIDE the agent (right), like workmux's `split: horizontal` layout; was 20%, widened by half
 
 
@@ -79,6 +84,140 @@ def clean_case(case):
     if case and (case.startswith(".") or "/" in case or "\\" in case):
         raise Fail(f"case '{case}' must be a single folder name (no '/', not starting with '.')")
     return case
+
+
+# The case KEY is the one value typed per launch. It becomes the case folder, the window name
+# (<workflow>-<key>) and the skill's argument, so each workflow says what a key looks like (`key:` in
+# workflows.yaml) and the launcher turns whatever was typed or pasted into that one canonical spelling.
+KEY_KINDS = {  # kind -> (what it is, example)
+    "github-issue": ("GitHub issue", "12345, repo#12345 or the issue URL"),
+    "github-pr": ("GitHub pull request", "12345, repo#12345 or the PR URL"),
+    "incident": ("incident.io reference", "INC-8745 or the incident.io URL"),
+    "cve": ("CVE ID", "CVE-2026-47848"),
+}
+GITHUB_URL = re.compile(r"https?://github\.com/[\w.-]+/([\w.-]+)/(?:issues|pull)/(\d+)")
+GITHUB_REPO_NUM = re.compile(r"(?:[\w.-]+/)?([\w.-]+)#(\d+)")  # repo#123 or org/repo#123
+GITHUB_FOLDER = re.compile(r"([A-Za-z][\w.]*(?:-[A-Za-z][\w.]*)*)-(\d+)")  # a canonical folder: repo-123
+INCIDENT_URL = re.compile(r"https?://app\.incident\.io/[\w.-]+/incidents/(\d+)")
+
+
+def parse_key_kind(kind, where="key", runtime_repo=False):
+    """`github-issue:camunda/camunda` -> ("github-issue", "camunda"). Raises Fail on anything unknown.
+    runtime_repo: a GitHub kind may leave the repo out, because the workflow learns it at launch (an epic)."""
+    base, _, arg = (kind or "").partition(":")
+    if base not in KEY_KINDS:
+        raise Fail(f"{where}: unknown key '{kind}'. Known: github-issue:<owner>/<repo>, github-pr:<owner>/<repo>, incident, cve")
+    repo = arg.rsplit("/", 1)[-1]
+    if base.startswith("github") and not (arg.count("/") == 1 and repo and arg.split("/")[0]):
+        if arg or not runtime_repo:
+            raise Fail(f"{where}: '{kind}' needs the default repo, e.g. {base}:camunda/camunda")
+        return base, ""
+    return base, repo
+
+
+def normalize_key(kind, text, label="", default_repo=None):
+    """The canonical case key for `text`, or a Fail that says what was expected. "" stays "".
+    GitHub: the default repo is a bare number (`65755`); any other repo is `repo-65755`. The default repo is
+    the one in `kind`, unless the caller knows better (an epic's issue repo; "" = it has none)."""
+    text = (text or "").strip()
+    if not text:
+        return ""
+    base, kind_repo = parse_key_kind(kind, runtime_repo=True)
+    default_repo = kind_repo if default_repo is None else default_repo
+    what, example = KEY_KINDS[base]
+    bad = Fail(f"'{text}' is not a valid {label or what} (expected {example})")
+    if base.startswith("github"):
+        if text.upper().startswith(("INC-", "CVE-", "SUPPORT-")):  # would otherwise parse as a repo named INC
+            raise bad
+        m = GITHUB_URL.fullmatch(text)
+        if m:
+            repo, num = m[1], m[2]
+        elif re.fullmatch(r"#?\d+", text):
+            if not default_repo:
+                raise Fail(f"'{text}' needs a repo: this epic has no `issues:` repo in its epic.yaml. "
+                           f"Type repo#{text.lstrip('#')} or the issue URL")
+            repo, num = default_repo, text.lstrip("#")
+        elif GITHUB_REPO_NUM.fullmatch(text) or GITHUB_FOLDER.fullmatch(text):
+            m = GITHUB_REPO_NUM.fullmatch(text) or GITHUB_FOLDER.fullmatch(text)
+            repo, num = m[1], m[2]
+        else:
+            raise bad
+        return str(int(num)) if repo == default_repo else f"{repo}-{int(num)}"
+    if base == "incident":
+        if re.fullmatch(r"(?i)SUPPORT-?\d+", text):
+            raise Fail(f"'{text}' is a Jira support ticket. Use its incident.io reference (INC-nnnn); the skill finds the Jira from it")
+        m = INCIDENT_URL.fullmatch(text) or re.fullmatch(r"(?i)INC-?(\d+)", text)
+        if not m:
+            raise bad
+        return f"INC-{int(m[1])}"
+    m = re.fullmatch(r"(?i)CVE-(\d{4})-(\d{4,})", text)  # cve
+    if not m:
+        raise bad
+    return f"CVE-{m[1]}-{m[2]}"
+
+
+# A workflow with `workspaces:` (epic) keeps one folder per epic under that root. Which epic is picked at launch,
+# the case is a task issue of it, and the case gets no folder of its own: the task's notes live in the epic
+# workspace, in the files the skill keeps there.
+LAST_FILE = ".last"         # in the workspaces root: the epic launched last (a folder's mtime says nothing, state sits deeper)
+SETTINGS_FILE = "epic.yaml"  # in an epic's folder: `repo:` its docs checkout, `issues:` owner/repo where bare task numbers live
+
+
+def last_workspace(root):
+    """The epic offered first: the one launched last, else the only one there is, else "" (Tab lists them)."""
+    try:
+        with open(os.path.join(root, LAST_FILE)) as f:
+            name = f.read().strip()
+    except OSError:
+        name = ""
+    if name and os.path.isdir(os.path.join(root, name)):
+        return name
+    names = list_names(root)
+    return names[0] if len(names) == 1 else ""
+
+
+def remember_workspace(root, name):
+    try:
+        with open(os.path.join(root, LAST_FILE), "w") as f:
+            f.write(name + "\n")
+    except OSError:
+        pass  # only a convenience
+
+
+def workspace_settings(ws_dir):
+    """{repo, issues} from <epic>/epic.yaml; both optional, both empty when the file is missing."""
+    path = os.path.join(ws_dir, SETTINGS_FILE)
+    try:
+        import yaml
+    except ImportError:
+        raise Fail(f"PyYAML is not importable from {sys.executable}")
+    try:
+        with open(path) as f:
+            data = yaml.safe_load(f) or {}
+    except FileNotFoundError:
+        return {"repo": "", "issues": ""}
+    except (OSError, yaml.YAMLError) as e:
+        raise Fail(f"cannot read {path}: {e}")
+    if not isinstance(data, dict) or set(data) - {"repo", "issues"}:
+        raise Fail(f"{path}: only `repo:` and `issues:` are allowed")
+    issues = str(data.get("issues") or "")
+    check_issues_repo(issues, path)
+    return {"repo": str(data.get("repo") or ""), "issues": issues}
+
+
+def check_issues_repo(issues, where):
+    if issues and not re.fullmatch(r"[\w.-]+/[\w.-]+", issues):
+        raise Fail(f"{where}: issues must be owner/repo, not '{issues}'")
+
+
+def save_workspace_settings(ws_dir, settings):
+    lines = ["# Read by the workflow launcher (tmux/popups/launcher.py) whenever this epic is picked."]
+    if settings.get("repo"):
+        lines.append(f"repo: {settings['repo']}        # the epic's docs checkout: the agent works here")
+    if settings.get("issues"):
+        lines.append(f"issues: {settings['issues']}        # where a bare task number lives (65 -> this repo's issue 65)")
+    with open(os.path.join(ws_dir, SETTINGS_FILE), "w") as f:
+        f.write("\n".join(lines) + "\n")
 
 
 def agent_kind(a):
@@ -156,18 +295,28 @@ def load():
                 raise Fail(f"{where}: {flag} must be true or false, not {w[flag]!r}")
         if w.get("agent") not in agents:
             raise Fail(f"{where}: agent '{w.get('agent')}' is not in {AGENTS_CONFIG} (have: {', '.join(agents)})")
-        for k in ("repo", "files", "skill", "model", "window", "case", "case_label"):
+        for k in ("repo", "files", "workspaces", "skill", "model", "window", "case", "case_label", "key"):
             w[k] = w.get(k) or ""
         w["case_label"] = w["case_label"] or "case"
         w["ask"] = list(w.get("ask") or [])
+        if w["workspaces"] and (w["files"] or w["repo"]):
+            raise Fail(f"{where}: `workspaces` (one folder per epic) replaces `files` and `repo`; the epic's epic.yaml holds its repo")
+        if "epic" in w["ask"] and not w["workspaces"]:
+            raise Fail(f"{where}: `ask: [epic]` needs `workspaces`")
+        if w["workspaces"] and "epic" in w["ask"] and "case" in w["ask"] and w["ask"].index("epic") > w["ask"].index("case"):
+            raise Fail(f"{where}: ask the epic before the case")
+        if w["key"]:
+            parse_key_kind(w["key"], where, runtime_repo=bool(w["workspaces"]))
+            if w["case"]:
+                raise Fail(f"{where}: `key` and a default `case` exclude each other (a key is always typed)")
         w["extra_dirs"] = list(w.get("extra_dirs") or [])
         if set(w["ask"]) - ASKABLE:
             raise Fail(f"{where}: `ask` can hold {sorted(ASKABLE)}, not {sorted(set(w['ask']) - ASKABLE)}")
-        if not (w["repo"] or w["files"]):
+        if not (w["repo"] or w["files"] or w["workspaces"]):
             raise Fail(f"{where}: needs a `repo`, a `files` folder, or both")
-        if w["worktree"] and not w["repo"]:
+        if w["worktree"] and not (w["repo"] or w["workspaces"]):
             raise Fail(f"{where}: worktree: true needs a `repo` to branch from")
-        if (w["case"] or "case" in w["ask"]) and not w["files"]:
+        if (w["case"] or "case" in w["ask"]) and not (w["files"] or w["workspaces"]):
             raise Fail(f"{where}: a case needs a `files` folder to live in")
         check_skill(agents, w["agent"], w["skill"], where)
         w["session"] = w.get("session") or name.split()[0]
@@ -197,6 +346,28 @@ def make_plan(name, wfs, agents, o):
         raise Fail(f"agent '{p['agent']}' is not defined (have: {', '.join(agents)})")
     check_skill(agents, p["agent"], p["skill"], f"workflow '{name}'")
 
+    settings = {}
+    if wf["workspaces"]:  # an epic: --files names its folder directly; else the picked one, else the one launched last
+        root = norm(wf["workspaces"])
+        if not os.path.isdir(root):
+            raise Fail(f"workspaces folder does not exist: {root}")
+        if o.get("files"):
+            ws = norm(o["files"])
+        else:
+            folder = clean_case(o.get("workspace") or last_workspace(root))
+            if not folder:
+                raise Fail(f"'{name}' needs its epic: name its folder with --files {short(root)}/<epic>")
+            ws = os.path.join(root, folder)
+        if not os.path.isdir(ws):
+            raise Fail(f"epic folder does not exist: {ws}")
+        settings = o.get("epic_settings") or workspace_settings(ws)
+        p["files"] = ws
+        if o.get("repo") is None:
+            p["repo"] = settings.get("repo", "")
+        p["workspace_root"], p["workspace"] = root, os.path.basename(ws)
+        # an epic that had no epic.yaml and was just asked for its repos: saved once the launch succeeds
+        p["new_settings"] = o.get("epic_settings") if o.get("epic_settings") and not os.path.exists(os.path.join(ws, SETTINGS_FILE)) else None
+
     p["repo"], p["files"] = norm(p["repo"]), norm(p["files"])
     if p["repo"] and not os.path.isdir(p["repo"]):
         raise Fail(f"repo does not exist: {p['repo']}")
@@ -204,11 +375,18 @@ def make_plan(name, wfs, agents, o):
         raise Fail(f"files folder does not exist: {p['files']} (create it, or fix `files:`; only the case folder is created for you)")
     if not (p["repo"] or p["files"]):
         raise Fail("needs a repo, a files folder, or both")
-    case = clean_case(expand_case(o["case"] if o.get("case") is not None else wf["case"], p["files"]))
+    case = expand_case(o["case"] if o.get("case") is not None else wf["case"], p["files"])
+    if wf["key"]:  # normalise first: a pasted URL holds slashes that a plain folder name must not
+        if not case.strip():
+            raise Fail(f"'{name}' needs its {wf['case_label']} (--case)")
+        issues_repo = (settings.get("issues") or "").rsplit("/", 1)[-1] if wf["workspaces"] else None
+        case = normalize_key(wf["key"], case, wf["case_label"], issues_repo)
+    case = clean_case(case)
     if case and not p["files"]:
         raise Fail("a case needs a files folder to live in")
     p["case"] = case
-    p["case_dir"] = os.path.join(p["files"], case) if case else p["files"]  # "" when there is no files folder
+    # "" when there is no files folder; an epic's task gets no folder of its own
+    p["case_dir"] = os.path.join(p["files"], case) if case and not wf["workspaces"] else p["files"]
     p["cwd"] = p["repo"] or p["case_dir"]  # where the agent starts (the repo; a worktree is made from it)
     p["pane_dir"] = p["case_dir"] or p["cwd"]  # where the right-hand shell opens
 
@@ -238,7 +416,8 @@ def make_plan(name, wfs, agents, o):
     if o.get("prompt") is not None:
         prompt = o["prompt"]
     else:
-        prompt = f"/{p['skill']}" + (f" {case}" if case else "") if p["skill"] else ""
+        arg = " ".join(filter(None, [case, f"epic={p['workspace']}" if wf["workspaces"] else ""]))
+        prompt = f"/{p['skill']}" + (f" {arg}" if arg else "") if p["skill"] else ""
     off = skill_switched_off(agents[p["agent"]], p["skill"]) if prompt.startswith(f"/{p['skill']}") else None
     if off:
         raise Fail(f"skill '{p['skill']}' is switched off in skillOverrides ({short(off)}), so the session would "
@@ -310,6 +489,8 @@ def summary(p, agents, switch=True):
     out.append(f"  agent  {p['agent']}" + (f" ({p['model']})" if p["model"] else ""))
     out.append("  skill  " + (p["prompt"] if p["prompt"] else (f"{p['skill']} (not started automatically)" if p["skill"] else "(none)")))
     out.append(f"  starts {short(p['cwd'])}" + ("  -> new worktree off it" if wt else ""))
+    if p.get("workspace"):
+        out.append(f"  epic   {p['workspace']}" + ("  (epic.yaml is saved with the launch)" if p.get("new_settings") else ""))
     if p["case_dir"]:
         out.append(f"  files  {short(p['case_dir'])}  (right-hand pane{', created if missing' if not os.path.isdir(p['case_dir']) else ''})")
     if p["extra"]:
@@ -351,6 +532,15 @@ def right_hand_pane(window):
 
 
 def launch(p, agents, dry, switch, show=True):
+    start_window(p, agents, dry, switch, show)
+    if dry or not p.get("workspace_root"):
+        return
+    if p.get("new_settings"):
+        save_workspace_settings(p["files"], p["new_settings"])
+    remember_workspace(p["workspace_root"], p["workspace"])
+
+
+def start_window(p, agents, dry, switch, show=True):
     if show:
         print(summary(p, agents, switch))
     if dry:
@@ -401,7 +591,7 @@ def pick(wfs):
             continue
         model = "-" if w["worktree"] else (w["model"] or "(default)")
         rows.append(cols(n, w["agent"], model, w["skill"] or "-", "yes" if w["worktree"] else "no",
-                         short(norm(w["repo"])) or "-", short(norm(w["files"])) or "-"))
+                         short(norm(w["repo"])) or "-", short(norm(w["files"] or w["workspaces"])) or "-"))
     # Columns are space-padded; two+ spaces end the first field, so --nth=1 matches the workflow
     # name only (typing "bet" must not fuzzy-match a path or agent column). --tiebreak=index: on a
     # tie YAML order wins, so keep the workflow you launch most often above its siblings.
@@ -614,17 +804,93 @@ def files_root(wf, o):
     return norm(o["files"] if o.get("files") is not None else wf["files"])
 
 
+def ask_workspace(wf, o):
+    """Which epic: the one launched last is offered; Tab lists the others."""
+    root = norm(wf["workspaces"])
+    default = last_workspace(root)
+    while True:
+        name = ask("epic", default, names_completer(root, newest=True))
+        try:
+            name = clean_case(name)
+        except Fail as e:
+            print(f"  {e}")
+            default = name
+            continue
+        if name and os.path.isdir(os.path.join(root, name)):
+            return name
+        print(f"  no epic folder '{name}' in {short(root)}" if name else "  the epic is required")
+        default = name
+
+
+def settings_for(wf, o):
+    """The picked epic's settings (empty for a workflow without epics)."""
+    if not wf["workspaces"]:
+        return {}
+    if o.get("epic_settings"):
+        return o["epic_settings"]
+    root = norm(wf["workspaces"])
+    name = o.get("workspace") or last_workspace(root)
+    return workspace_settings(os.path.join(root, name)) if name else {}
+
+
+def first_time_settings(wf, o):
+    """An epic with no epic.yaml yet: ask for its two repos once. They are saved when the launch succeeds."""
+    ws = os.path.join(norm(wf["workspaces"]), o["workspace"])
+    if os.path.exists(os.path.join(ws, SETTINGS_FILE)):
+        return
+    print(f"\n  {o['workspace']} has no {SETTINGS_FILE} yet; asked once, saved with the launch")
+    repo = ask("docs repo checkout (empty = none)", "", path_completer)
+    while True:
+        issues = ask("repo that holds its task issues, owner/repo (empty = none)", "")
+        try:
+            check_issues_repo(issues, "launch")
+            break
+        except Fail as e:
+            print(f"  {e}")
+    o["epic_settings"] = {"repo": repo, "issues": issues}
+
+
+def ask_case(wf, root, issues=""):
+    """The case field. A workflow with a `key:` re-asks until the answer is a valid key (shown in its
+    canonical spelling), so a typo costs one line, not the whole launch. An epic's task field offers no Tab list:
+    the folders under the epic are not tasks."""
+    complete = None if wf["workspaces"] else names_completer(root, newest=True)
+    if not wf["key"]:
+        return ask(wf["case_label"] + " (empty = none)", expand_case(wf["case"], root), complete)
+    issues_repo = (issues or "").rsplit("/", 1)[-1] if wf["workspaces"] else None
+    default = ""
+    while True:
+        answer = ask(wf["case_label"], default, complete)
+        try:
+            key = normalize_key(wf["key"], answer, wf["case_label"], issues_repo)
+            if key:
+                if key != answer:
+                    print(f"  -> {key}")
+                return key
+            print(f"  {wf['case_label']} is required")
+        except Fail as e:
+            print(f"  {e}")
+            default = answer
+
+
 def quick(wf, o):
     """The plain Enter flow: only the fields the workflow marks `ask:` (its case, maybe its repo)."""
     for key in wf["ask"]:
-        if key == "case":
-            o["case"] = ask(wf["case_label"] + " (empty = none)", expand_case(wf["case"], files_root(wf, o)),
-                            names_completer(files_root(wf, o), newest=True))
+        if key == "epic":
+            o["workspace"] = ask_workspace(wf, o)
+            first_time_settings(wf, o)
+        elif key == "case":
+            o["case"] = ask_case(wf, files_root(wf, o), settings_for(wf, o).get("issues", ""))
         elif key == "repo":
             o["repo"] = ask("repo (empty = none)", wf["repo"], path_completer)
 
 
 def edit(wf, agents, o):
+    ws = bool(wf["workspaces"])
+    if ws:
+        o["workspace"] = ask_workspace(wf, o)
+        first_time_settings(wf, o)
+    settings = settings_for(wf, o)
     while True:
         o["agent"] = ask(f"agent ({', '.join(agents)})", wf["agent"])
         if o["agent"] in agents:
@@ -637,7 +903,7 @@ def edit(wf, agents, o):
             break
         except Fail as e:
             print(f"  {e}")
-    o["repo"] = ask("repo (empty = none)", wf["repo"], path_completer)
+    o["repo"] = ask("repo (empty = none)", settings.get("repo", "") if ws else wf["repo"], path_completer)
     o["worktree"] = False
     if o["repo"]:
         while True:
@@ -653,9 +919,9 @@ def edit(wf, agents, o):
         o["window"] = ask("window name (empty = auto)", wf["window"])
     else:
         o["window"] = ask("window name (empty = branch name)", wf["window"])
-    o["files"] = ask("files folder (empty = none)", wf["files"], path_completer)
-    o["case"] = ask(wf["case_label"] + " (empty = none)", expand_case(wf["case"], norm(o["files"])),
-                    names_completer(norm(o["files"]), newest=True))
+    if not ws:
+        o["files"] = ask("files folder (empty = none)", wf["files"], path_completer)
+    o["case"] = ask_case(wf, "" if ws else norm(o["files"]), settings.get("issues", ""))
 
 
 def run(args):
@@ -695,7 +961,8 @@ def main():
     ap.add_argument("--agent"), ap.add_argument("--model"), ap.add_argument("--name", help="window name")
     ap.add_argument("--skill", help="skill to start (empty = none)")
     ap.add_argument("--repo", help="git repo the agent works in; a worktree branches off it")
-    ap.add_argument("--files", help="folder that holds the cases; the right-hand pane opens in <files>/<case>")
+    ap.add_argument("--files", help="folder that holds the cases; the right-hand pane opens in <files>/<case>. "
+                                    "For an epic workflow: the epic's folder (default: the epic launched last)")
     ap.add_argument("--case", help="case folder name under --files (PR number, issue-slug, date, ...)")
     ap.add_argument("--branch", help="branch for a new worktree")
     ap.add_argument("--prompt", help="first prompt, instead of '/<skill> <case>'")

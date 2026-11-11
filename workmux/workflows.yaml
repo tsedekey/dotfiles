@@ -26,6 +26,25 @@
 #           folder; the skill finds it and resumes from its checkpoint.
 #           Empty = no default; with `ask: [case]` the Enter flow asks for it (Tab lists existing cases).
 #   case_label  what the prompt calls the case ("PR number").
+#   workspaces  instead of `files`/`repo`, for a workflow that works on one epic at a time: a folder holding one
+#           sub-folder per epic. The launcher asks WHICH epic (offering the one launched last, remembered in
+#           <workspaces>/.last; Tab lists the others), the right-hand pane opens in that epic's folder, and the
+#           case (a task issue of the epic) gets no folder of its own. <epic>/epic.yaml holds two optional
+#           settings, asked once for a new epic: `repo:` the epic's docs checkout (the agent works there) and
+#           `issues:` owner/repo, where a bare task number lives. The skill is started as
+#           `/<skill> <task> epic=<epic folder name>`. CLI: --files <epic folder> names the epic.
+#   key     the case is ONE typed value, the case KEY, and it is all of these at once: the case folder
+#           (<files>/<key>), the window name (<workflow>-<key>) and the skill's argument (/<skill> <key>).
+#           The skill looks up everything else (title, Slack channel, Jira, linked PRs) from the key and
+#           records it in the case checkpoint. The launcher turns what you typed or pasted into the one
+#           canonical spelling and refuses anything else. Kinds:
+#             github-issue:<owner>/<repo>   65755 | #65755 | repo#65755 | the issue URL. The workflow's
+#             github-pr:<owner>/<repo>      default repo is the bare number (folder 65755); any other repo is
+#                                           repo-65755 (folder dmn-scala-391).
+#             incident                      INC-8745 | the incident.io URL. A SUPPORT-nnnnn Jira key is refused.
+#             cve                           CVE-2026-47848 (any case)
+#           A workflow with a `key` has no default `case`. Workflows without one (medic, release, daily,
+#           general) take the `case` text as typed.
 #   ask     fields the plain Enter flow asks for: case, repo. (The Tab flow always asks for everything.)
 #   worktree  false (default)  a plain tmux window; the agent is typed into its shell. No git needed.
 #             true             first creates a worktree: `workmux add <branch> -a <agent> --parent-session
@@ -54,8 +73,9 @@ workflows:
     model: claude-sonnet-5.5
     skill: change-companion
     repo: ~/dev/camunda/camunda        # worktree off it is optional (Tab flow)
-    files: ~/.local/share/camunda/change-companion    # <issue>-<slug>/
-    case_label: issue-slug
+    files: ~/.local/share/camunda/change-companion    # <issue number>/
+    key: github-issue:camunda/camunda
+    case_label: GitHub issue
     ask: [case]
 
   dagrunner:                           # the run stage; started BY the change session on the DagRunner path
@@ -71,15 +91,17 @@ workflows:
     agent: claude
     model: claude-sonnet-5-5           # Claude ids are hyphenated (Copilot's are claude-sonnet-5.5)
     skill: epic-companion
-    files: ~/.local/share/camunda/epic-companion    # <epic-slug>/
-    case_label: epic-slug
-    ask: [case, repo]                  # repo = the epic's docs repo (differs per epic; Tab lists ~/dev/camunda)
+    workspaces: ~/.local/share/camunda/epic-companion    # one folder per epic, e.g. product-hub-3517-variable-trace/
+    key: github-issue                  # the TASK issue; its default repo is the epic's `issues:` in <epic>/epic.yaml
+    case_label: task issue
+    ask: [epic, case]                  # which epic (offers the one launched last), then the task
 
   review:                              # reads the PR; no code to change, so it starts in its case folder
     agent: copilot
     model: claude-sonnet-5.5
     skill: review-companion
-    files: ~/.local/share/camunda/review-companion/cases    # <PR number>/
+    files: ~/.local/share/camunda/review-companion/cases    # <PR number>/ (other repos: dmn-scala-391/)
+    key: github-pr:camunda/camunda
     case_label: PR number
     ask: [case]
     extra_dirs: [~/dev/camunda/camunda]
@@ -87,8 +109,9 @@ workflows:
   investigate:
     agent: claude
     skill: investigate-companion
-    files: ~/.local/share/camunda/investigate-companion/cases    # <incident number>/
-    case_label: incident
+    files: ~/.local/share/camunda/investigate-companion/cases    # <INC-nnnn>/
+    key: incident
+    case_label: incident.io ref
     ask: [case]
     extra_dirs: [~/dev/camunda/camunda]
 
@@ -96,6 +119,7 @@ workflows:
     agent: claude
     skill: assess-companion
     files: ~/.local/share/camunda/assess-companion/cases    # <CVE-ID>/
+    key: cve
     case_label: CVE ID
     ask: [case]
 
