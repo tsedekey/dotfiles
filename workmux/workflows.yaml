@@ -26,6 +26,11 @@
 #           folder; the skill finds it and resumes from its checkpoint.
 #           Empty = no default; with `ask: [case]` the Enter flow asks for it (Tab lists existing cases).
 #   case_label  what the prompt calls the case ("PR number").
+#   case_arg  false = start the skill WITHOUT the case (`/<skill>`), for a skill that takes no argument.
+#           Default true: `/<skill> <case>`. The case still names the folder and the window.
+#   reuse   true = launching again, when the window `<window>` is already open in the session, switches to
+#           it and starts nothing (no second agent, no new folder). Default false: every launch opens a
+#           new window. Plain windows only; a worktree already has `workmux add`'s own handling.
 #   workspaces  instead of `files`/`repo`, for a workflow that works on one epic at a time: a folder holding one
 #           sub-folder per epic. The launcher asks WHICH epic (offering the one launched last, remembered in
 #           <workspaces>/.last; Tab lists the others), the right-hand pane opens in that epic's folder, and the
@@ -140,10 +145,13 @@ workflows:
     ask: [case]
     extra_dirs: [~/dev/camunda/camunda]    # (guess) the skill's steps run git in the code checkout
 
-  daily:
+  daily:                               # one window and one folder per day: launching again goes back to it
     agent: claude
     skill: daily-companion
-    files: ~/.local/share/camunda/daily-companion
+    files: ~/.local/share/camunda/daily-companion/daily    # <date>/ (the report, run log and DX data stay in daily-companion/)
+    case: "{date}"
+    case_arg: false                    # the skill takes no argument: the date is only the folder and window name
+    reuse: true
 
   general:                             # Claude on the personal profile. Not for work code.
     agent: claude-personal             # CLAUDE_CONFIG_DIR=~/.claude-personal, not ~/.claude

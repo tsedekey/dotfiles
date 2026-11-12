@@ -22,6 +22,8 @@ that same value, and a pasted URL or a wrong-case spelling is turned into the ca
 The epic workflow is the exception: it asks WHICH epic first (`workspaces:`, the one launched last is offered),
 and the key is a task issue of that epic; the task has no folder of its own (see workflows.yaml).
 The agent starts in the repo (or its new worktree) when there is one, otherwise in the case folder.
+`reuse: true` (daily): launching again switches to the window that is already open instead of starting a
+second one; `case_arg: false` keeps the case out of the skill's prompt.
 The session is the workflow's first word and is created when missing.  Every window is monitored
 because the agents' own workmux hooks register the pane; nothing here talks to workmux except
 `worktree: true`, which runs `workmux add`.
@@ -44,7 +46,7 @@ os.environ["PATH"] = f"{HOME}/.local/bin:/opt/homebrew/bin:{os.environ.get('PATH
 WORKFLOWS = os.environ.get("LAUNCHER_WORKFLOWS", f"{HOME}/dotfiles/workmux/workflows.yaml")
 AGENTS_CONFIG = os.environ.get("LAUNCHER_AGENTS_CONFIG", f"{HOME}/.config/workmux/config.yaml")
 FIELDS = {"worktree", "session", "agent", "model", "skill", "repo", "files", "workspaces", "case", "case_label",
-          "key", "ask", "extra_dirs", "hidden", "window"}
+          "key", "ask", "extra_dirs", "hidden", "window", "reuse", "case_arg"}
 ASKABLE = {"epic", "case", "repo"}  # fields a workflow can make the plain Enter flow ask for
 SPLIT = "30%"  # shell pane BESIDE the agent (right), like workmux's `split: horizontal` layout; was 20%, widened by half
 
@@ -289,10 +291,12 @@ def load():
             raise Fail(f"{where}: `dir` was split into `repo` (the git repo) and `files` (where the session's files live)")
         if set(w) - FIELDS:
             raise Fail(f"{where}: unknown field(s) {sorted(set(w) - FIELDS)}; allowed {sorted(FIELDS)}")
-        for flag in ("worktree", "hidden"):
-            w[flag] = w.get(flag, False)
+        for flag, default in (("worktree", False), ("hidden", False), ("reuse", False), ("case_arg", True)):
+            w[flag] = w.get(flag, default)
             if not isinstance(w[flag], bool):
                 raise Fail(f"{where}: {flag} must be true or false, not {w[flag]!r}")
+        if w["reuse"] and w["worktree"]:
+            raise Fail(f"{where}: `reuse` applies to plain windows; `workmux add` already handles an existing worktree")
         if w.get("agent") not in agents:
             raise Fail(f"{where}: agent '{w.get('agent')}' is not in {AGENTS_CONFIG} (have: {', '.join(agents)})")
         for k in ("repo", "files", "workspaces", "skill", "model", "window", "case", "case_label", "key"):
@@ -416,7 +420,7 @@ def make_plan(name, wfs, agents, o):
     if o.get("prompt") is not None:
         prompt = o["prompt"]
     else:
-        arg = " ".join(filter(None, [case, f"epic={p['workspace']}" if wf["workspaces"] else ""]))
+        arg = " ".join(filter(None, [case if wf["case_arg"] else "", f"epic={p['workspace']}" if wf["workspaces"] else ""]))
         prompt = f"/{p['skill']}" + (f" {arg}" if arg else "") if p["skill"] else ""
     off = skill_switched_off(agents[p["agent"]], p["skill"]) if prompt.startswith(f"/{p['skill']}") else None
     if off:
@@ -491,6 +495,9 @@ def summary(p, agents, switch=True):
     out.append(f"  starts {short(p['cwd'])}" + ("  -> new worktree off it" if wt else ""))
     if p.get("workspace"):
         out.append(f"  epic   {p['workspace']}" + ("  (epic.yaml is saved with the launch)" if p.get("new_settings") else ""))
+    if p["reuse"] and not wt:
+        out.append("  reuse  " + (("the window is open: nothing started" + (", you would be switched to it" if switch else ""))
+                                   if open_window(p["session"], p["window"]) else "no such window yet: a new one is started"))
     if p["case_dir"]:
         out.append(f"  files  {short(p['case_dir'])}  (right-hand pane{', created if missing' if not os.path.isdir(p['case_dir']) else ''})")
     if p["extra"]:
@@ -512,6 +519,17 @@ def tmux(*args):
 def ensure_session(session, cwd):
     if subprocess.run(["tmux", "has-session", "-t", f"={session}"], capture_output=True).returncode:
         tmux("new-session", "-d", "-s", session, "-c", cwd)
+
+
+def open_window(session, name):
+    """The id of the window called `name` in `session`, or None (also when there is no such session)."""
+    r = subprocess.run(["tmux", "list-windows", "-t", f"={session}:", "-F", "#{window_id} #{window_name}"],
+                       capture_output=True, text=True)
+    for line in r.stdout.splitlines() if not r.returncode else []:
+        wid, _, wname = line.partition(" ")
+        if wname == name:
+            return wid
+    return None
 
 
 def window_ids(session):
@@ -549,6 +567,13 @@ def start_window(p, agents, dry, switch, show=True):
     if p["case_dir"]:
         os.makedirs(p["case_dir"], exist_ok=True)  # only the case folder; the files root must already exist
     ensure_session(s, cwd)
+    if p["reuse"] and not p["worktree"]:
+        have = open_window(s, p["window"])
+        if have:  # today's window is already open: go back to it instead of starting a second agent
+            if switch:
+                tmux("switch-client", "-t", have)
+            print(f"  already open: {s}:{p['window']}" + (", switched to it" if switch else ""))
+            return
     if p["worktree"]:
         argv, before = worktree_argv(p, switch), window_ids(s)
         # Inherit the terminal: workmux may ask something (e.g. trust a project config) and its own
