@@ -109,6 +109,23 @@ agents:
       PLANNOTATOR_PLAN_REVIEW: "0"      # inert on pinned v0.28.51; honoured after an upgrade
       COPILOT_HOME: /Users/eddie.tsedeke/.copilot
 
+  # Same Copilot, but with the extended 1M-token context window (--context long_context;
+  # the default tier is what plain `copilot` uses). Added 2026-11-12 because planning and
+  # PR-review sessions filled the default window and compacted often. Costs more AI credits
+  # per token, so it is used only for those two workflows, not for babysit ticks or draft-PR
+  # completion. Model (claude-sonnet-5.5) and effort come from ~/.copilot/settings.json.
+  #   wm add <branch> -a copilot-long
+  copilot-long:
+    command: copilot
+    args:
+      - --allow-all
+      - --context
+      - long_context
+    env:
+      NO_ANON_PING: "1"                 # Plannotator ping off (only opt-out)
+      PLANNOTATOR_PLAN_REVIEW: "0"      # inert on pinned v0.28.51; honoured after an upgrade
+      COPILOT_HOME: /Users/eddie.tsedeke/.copilot
+
   # OpenCode on an OpenRouter model, using a provisioned OpenRouter key
   # (US region; see ~/.config/opencode/opencode.json).
   # The key is NOT in this file: the wrapper reads it from the macOS keychain

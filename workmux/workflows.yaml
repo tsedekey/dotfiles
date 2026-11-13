@@ -91,7 +91,7 @@
 
 workflows:
   change:                              # plan stage: Copilot in the main checkout, no worktree
-    agent: copilot
+    agent: copilot-long                # copilot + the extended 1M context tier (see the agent in config.yaml)
     model: claude-sonnet-5.5
     effort: xhigh                      # planning is where depth pays off; the other workflows keep the harness default for now
     skill: change-companion
@@ -121,7 +121,7 @@ workflows:
     ask: [epic, case]                  # which epic (offers the one launched last), then the task
 
   review:                              # reads the PR; no code to change, so it starts in its case folder
-    agent: copilot
+    agent: copilot-long                # copilot + the extended 1M context tier (see the agent in config.yaml)
     model: claude-sonnet-5.5
     skill: review-companion
     files: ~/.local/share/camunda/review-companion/cases    # <PR number>/ (other repos: dmn-scala-391/)
