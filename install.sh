@@ -89,6 +89,37 @@ info "asdf tool versions"
 link_file "$DOTFILES_DIR/asdf/.tool-versions"  "$HOME/.tool-versions"
 echo ""
 
+# --- Ghostty ---
+info "Ghostty configuration"
+link_file "$DOTFILES_DIR/ghostty/config"       "$HOME/.config/ghostty/config"
+echo ""
+
+# --- Yazi ---
+info "Yazi configuration"
+link_file "$DOTFILES_DIR/yazi/theme.toml"      "$HOME/.config/yazi/theme.toml"
+echo ""
+
+# --- Agent icon font (Claude / OpenCode logos for the workmux sidebar) ---
+# Copied, not symlinked: CoreText is not guaranteed to follow symlinks in ~/Library/Fonts.
+# Ghostty maps U+E400-E403 to it (font-codepoint-map in ghostty/config). Rebuild with
+# fonts/agent-icons/build.py. Reload Ghostty (cmd+shift+,) after the first install.
+info "Agent icon font"
+FONT_SRC="$DOTFILES_DIR/fonts/agent-icons/AgentIcons.otf"
+FONT_DST="$HOME/Library/Fonts/AgentIcons.otf"
+if cmp -s "$FONT_SRC" "$FONT_DST" 2>/dev/null; then
+  ok "$FONT_DST (already up to date)"
+else
+  mkdir -p "$HOME/Library/Fonts"
+  cp "$FONT_SRC" "$FONT_DST"
+  ok "Copied AgentIcons.otf -> $FONT_DST"
+fi
+echo ""
+
+# --- workmux ---
+info "workmux configuration"
+link_file "$DOTFILES_DIR/workmux/config.yaml"  "$HOME/.config/workmux/config.yaml"
+echo ""
+
 # =============================================================
 # Post-install: TPM (tmux plugin manager)
 # =============================================================

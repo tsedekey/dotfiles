@@ -1,0 +1,34 @@
+# Theme — Catppuccin Mocha (matches tmux)
+theme = Catppuccin Mocha
+background = #11111b
+
+# Font
+font-family = JetBrainsMono Nerd Font
+font-size = 13
+# Agent logos for the workmux sidebar: Claude / OpenCode / Copilot marks live in a tiny
+# custom font at private-use U+E400-E403 (fonts/agent-icons/, installed by install.sh).
+font-codepoint-map = U+E400-U+E403=AgentIcons
+
+# Scrollback
+scrollback-limit = 10000
+
+# Window chrome
+macos-titlebar-style = hidden
+window-padding-x = 8
+window-padding-y = 4
+background-opacity = 0.85
+background-blur-radius = 20
+
+# Cursor
+cursor-style = block
+cursor-style-blink = true
+
+# Behavior
+mouse-hide-while-typing = true
+copy-on-select = clipboard
+
+# Shell integration (semantic marks, prompts, etc.)
+shell-integration = detect
+
+# Converts only the left Option key, leaving the right one free for typing special characters
+macos-option-as-alt = left

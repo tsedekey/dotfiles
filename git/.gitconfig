@@ -40,3 +40,13 @@
 # Machine-specific overrides (credentials, work repos, etc.)
 [include]
 	path = ~/.gitconfig.local
+[credential "https://github.com"]
+	helper = 
+	helper = !/opt/homebrew/bin/gh auth git-credential
+[credential "https://gist.github.com"]
+	helper = 
+	helper = !/opt/homebrew/bin/gh auth git-credential
+[url "https://github.com/"]
+	insteadOf = git@github.com:
+[credential]
+	helper = osxkeychain
