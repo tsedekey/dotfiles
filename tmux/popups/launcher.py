@@ -4,13 +4,15 @@
   popup    Pick a workflow in fzf.  Enter = launch with its defaults (a workflow may first ask for its case,
            and for a repo).  Tab = edit every field first.  In the path fields (repo, files, case, skill)
            Tab lists what is in the folder typed so far and you pick from it instead of looking it up.
-  CLI      launcher.py review [--agent A] [--skill S] [--model M] [--name N] [--repo R] [--files F]
+  CLI      launcher.py review [--agent A] [--skill S] [--model M] [--effort E] [--name N] [--repo R] [--files F]
            [--case C] [--branch B] [--prompt P] [--[no-]worktree] [--dry-run] [--no-switch].
            Naming a workflow skips the UI and NEVER prompts (scripts, tests and other agents use this;
            hidden workflows such as `dagrunner` can only be started this way).
 
 A workflow is five things (defaults in dotfiles/workmux/workflows.yaml, explained there):
   agent + model   which harness runs, from the `agents:` block of ~/.config/workmux/config.yaml
+  effort          optional reasoning effort (low|medium|high|xhigh|max): `--effort` for Claude,
+                  `--reasoning-effort` for Copilot; empty = the harness' own setting (effortLevel)
   skill           started as the agent's first prompt: `/<skill> <case>`
   repo            optional git repo the agent works in; a worktree, when asked for, branches off it
   files + case    where the session's artifacts live: <files>/<case>/. The right-hand shell pane opens
@@ -19,6 +21,8 @@ A workflow is five things (defaults in dotfiles/workmux/workflows.yaml, explaine
 The case is the one value you type, and where a workflow has a `key:` (GitHub issue or PR, incident.io
 ref, CVE ID) it is a KEY: the case folder, the window (<workflow>-<key>) and the skill's argument are all
 that same value, and a pasted URL or a wrong-case spelling is turned into the canonical one (normalize_key).
+`key_repo_root` (change) nests the key: an issue in another repo is `<short repo>/<number>` (pdp-3517/153), so the
+case folder is <files>/pdp-3517/153, the window change-pdp-3517-153, and the prompt carries `repo=<full name>`.
 The epic workflow is the exception: it asks WHICH epic first (`workspaces:`, the one launched last is offered),
 and the key is a task issue of that epic; the task has no folder of its own (see workflows.yaml).
 The agent starts in the repo (or its new worktree) when there is one, otherwise in the case folder.
@@ -45,7 +49,7 @@ HOME = os.path.expanduser("~")
 os.environ["PATH"] = f"{HOME}/.local/bin:/opt/homebrew/bin:{os.environ.get('PATH', '')}"
 WORKFLOWS = os.environ.get("LAUNCHER_WORKFLOWS", f"{HOME}/dotfiles/workmux/workflows.yaml")
 AGENTS_CONFIG = os.environ.get("LAUNCHER_AGENTS_CONFIG", f"{HOME}/.config/workmux/config.yaml")
-FIELDS = {"worktree", "session", "agent", "model", "skill", "repo", "files", "workspaces", "case", "case_label",
+FIELDS = {"worktree", "session", "agent", "model", "effort", "key_repo_root", "skill", "repo", "files", "workspaces", "case", "case_label",
           "key", "ask", "extra_dirs", "hidden", "window", "reuse", "case_arg"}
 ASKABLE = {"epic", "case", "repo"}  # fields a workflow can make the plain Enter flow ask for
 SPLIT = "30%"  # shell pane BESIDE the agent (right), like workmux's `split: horizontal` layout; was 20%, widened by half
@@ -99,7 +103,10 @@ KEY_KINDS = {  # kind -> (what it is, example)
 }
 GITHUB_URL = re.compile(r"https?://github\.com/[\w.-]+/([\w.-]+)/(?:issues|pull)/(\d+)")
 GITHUB_REPO_NUM = re.compile(r"(?:[\w.-]+/)?([\w.-]+)#(\d+)")  # repo#123 or org/repo#123
-GITHUB_FOLDER = re.compile(r"([A-Za-z][\w.]*(?:-[A-Za-z][\w.]*)*)-(\d+)")  # a canonical folder: repo-123
+GITHUB_FOLDER = re.compile(r"([A-Za-z](?:[\w.-]*[\w.])?)-(\d+)")  # a canonical folder: repo-123. The number is the LAST
+# dash-part, so a repo name may hold digits and dashes of its own (pdp-3517-variable-trace-153)
+GITHUB_NESTED = re.compile(r"([A-Za-z][\w.-]*)/(\d+)")  # repo/123: the nested key (change), same as its folder
+EPIC_PREFIX = re.compile(r"[A-Za-z]+-\d+")  # pdp-3517: the short name of an epic repo (pdp-3517-variable-trace)
 INCIDENT_URL = re.compile(r"https?://app\.incident\.io/[\w.-]+/incidents/(\d+)")
 
 
@@ -117,16 +124,33 @@ def parse_key_kind(kind, where="key", runtime_repo=False):
     return base, repo
 
 
-def normalize_key(kind, text, label="", default_repo=None):
+def short_repo(repo):
+    """The short name an epic repo goes by in folders and windows: pdp-3517-variable-trace -> pdp-3517. A repo
+    without a `<letters>-<digits>` prefix (dmn-scala) keeps its whole name."""
+    m = re.match(r"[A-Za-z]+-\d+(?=-|$)", repo)
+    return m[0] if m else repo
+
+
+def normalize_key(kind, text, label="", default_repo=None, nested=False):
     """The canonical case key for `text`, or a Fail that says what was expected. "" stays "".
-    GitHub: the default repo is a bare number (`65755`); any other repo is `repo-65755`. The default repo is
-    the one in `kind`, unless the caller knows better (an epic's issue repo; "" = it has none)."""
+    See key_info for the spelling."""
+    return key_info(kind, text, label, default_repo, nested)[0]
+
+
+def key_info(kind, text, label="", default_repo=None, nested=False):
+    """(canonical key, the other repo the issue lives in or "" for the default repo). "" stays ("", "").
+    GitHub: the default repo is a bare number (`65755`). Any other repo is `repo-65755`, or, nested (`change`),
+    `<short repo>/65755` with the number as its own sub-folder (`pdp-3517/153`). The repo comes back as the
+    typed or pasted one: the full name from a URL, maybe only the short name from `pdp-3517/153`. The default
+    repo is the one in `kind`, unless the caller knows better (an epic's issue repo; "" = it has none)."""
     text = (text or "").strip()
     if not text:
-        return ""
+        return "", ""
     base, kind_repo = parse_key_kind(kind, runtime_repo=True)
     default_repo = kind_repo if default_repo is None else default_repo
     what, example = KEY_KINDS[base]
+    if nested:
+        example = "12345, repo#12345, repo/12345 or the issue URL"
     bad = Fail(f"'{text}' is not a valid {label or what} (expected {example})")
     if base.startswith("github"):
         if text.upper().startswith(("INC-", "CVE-", "SUPPORT-")):  # would otherwise parse as a repo named INC
@@ -139,23 +163,43 @@ def normalize_key(kind, text, label="", default_repo=None):
                 raise Fail(f"'{text}' needs a repo: this epic has no `issues:` repo in its epic.yaml. "
                            f"Type repo#{text.lstrip('#')} or the issue URL")
             repo, num = default_repo, text.lstrip("#")
-        elif GITHUB_REPO_NUM.fullmatch(text) or GITHUB_FOLDER.fullmatch(text):
-            m = GITHUB_REPO_NUM.fullmatch(text) or GITHUB_FOLDER.fullmatch(text)
+        elif GITHUB_REPO_NUM.fullmatch(text) or (GITHUB_NESTED if nested else GITHUB_FOLDER).fullmatch(text):
+            m = GITHUB_REPO_NUM.fullmatch(text) or (GITHUB_NESTED if nested else GITHUB_FOLDER).fullmatch(text)
             repo, num = m[1], m[2]
         else:
             raise bad
-        return str(int(num)) if repo == default_repo else f"{repo}-{int(num)}"
+        if repo == default_repo:
+            return str(int(num)), ""
+        return (f"{short_repo(repo)}/{int(num)}" if nested else f"{repo}-{int(num)}"), repo
     if base == "incident":
         if re.fullmatch(r"(?i)SUPPORT-?\d+", text):
             raise Fail(f"'{text}' is a Jira support ticket. Use its incident.io reference (INC-nnnn); the skill finds the Jira from it")
         m = INCIDENT_URL.fullmatch(text) or re.fullmatch(r"(?i)INC-?(\d+)", text)
         if not m:
             raise bad
-        return f"INC-{int(m[1])}"
+        return f"INC-{int(m[1])}", ""
     m = re.fullmatch(r"(?i)CVE-(\d{4})-(\d{4,})", text)  # cve
     if not m:
         raise bad
-    return f"CVE-{m[1]}-{m[2]}"
+    return f"CVE-{m[1]}-{m[2]}", ""
+
+
+def resolve_repo(repo, root):
+    """(full repo name, its checkout under `root` or "") for an issue in another repo. `repo` is what was parsed: a
+    full name (a URL, `pdp-3517-variable-trace#153`) or only the short epic name (`pdp-3517/153`), which is
+    looked up as a checkout: `<root>/pdp-3517` or the one `<root>/pdp-3517-*`. Several matches are an error."""
+    full = repo
+    if EPIC_PREFIX.fullmatch(repo):  # the short name of an epic repo: find the checkout
+        full = ""
+        if os.path.isdir(os.path.join(root, repo)):
+            full = repo
+        else:
+            hits = sorted(n for n in list_names(root) if n.startswith(repo + "-"))
+            if len(hits) > 1:
+                raise Fail(f"'{repo}' matches several checkouts in {short(root)} ({', '.join(hits)}): paste the issue URL")
+            full = hits[0] if hits else ""
+    checkout = os.path.join(root, full) if full else ""
+    return full, checkout if checkout and os.path.isdir(checkout) else ""
 
 
 # A workflow with `workspaces:` (epic) keeps one folder per epic under that root. Which epic is picked at launch,
@@ -220,6 +264,13 @@ def save_workspace_settings(ws_dir, settings):
         lines.append(f"issues: {settings['issues']}        # where a bare task number lives (65 -> this repo's issue 65)")
     with open(os.path.join(ws_dir, SETTINGS_FILE), "w") as f:
         f.write("\n".join(lines) + "\n")
+
+
+# Reasoning effort is a per-launch flag, and each harness spells it differently. OpenCode and unknown agents
+# have none, so an effort for them is ignored (with a note), like the model is for a worktree.
+EFFORT_FLAG = {"claude": "--effort", "copilot": "--reasoning-effort"}
+EFFORTS = {"claude": ("low", "medium", "high", "xhigh", "max"),
+           "copilot": ("none", "minimal", "low", "medium", "high", "xhigh", "max")}
 
 
 def agent_kind(a):
@@ -299,8 +350,11 @@ def load():
             raise Fail(f"{where}: `reuse` applies to plain windows; `workmux add` already handles an existing worktree")
         if w.get("agent") not in agents:
             raise Fail(f"{where}: agent '{w.get('agent')}' is not in {AGENTS_CONFIG} (have: {', '.join(agents)})")
-        for k in ("repo", "files", "workspaces", "skill", "model", "window", "case", "case_label", "key"):
+        for k in ("repo", "files", "workspaces", "skill", "model", "effort", "key_repo_root", "window", "case", "case_label", "key"):
             w[k] = w.get(k) or ""
+        w["effort"] = str(w["effort"]).lower()
+        if w["effort"] and w["effort"] not in set().union(*EFFORTS.values()):
+            raise Fail(f"{where}: effort '{w['effort']}' is not one of {', '.join(EFFORTS['copilot'])}")
         w["case_label"] = w["case_label"] or "case"
         w["ask"] = list(w.get("ask") or [])
         if w["workspaces"] and (w["files"] or w["repo"]):
@@ -313,6 +367,8 @@ def load():
             parse_key_kind(w["key"], where, runtime_repo=bool(w["workspaces"]))
             if w["case"]:
                 raise Fail(f"{where}: `key` and a default `case` exclude each other (a key is always typed)")
+        if w["key_repo_root"] and not w["key"].startswith("github"):
+            raise Fail(f"{where}: `key_repo_root` needs a GitHub `key` (it maps a repo-<number> key to a checkout)")
         w["extra_dirs"] = list(w.get("extra_dirs") or [])
         if set(w["ask"]) - ASKABLE:
             raise Fail(f"{where}: `ask` can hold {sorted(ASKABLE)}, not {sorted(set(w['ask']) - ASKABLE)}")
@@ -339,13 +395,16 @@ def make_plan(name, wfs, agents, o):
     if name not in wfs:
         raise Fail(f"unknown workflow '{name}'. Known: {', '.join(wfs)}")
     wf = wfs[name]
-    p = dict(wf, name=name, branch=o.get("branch") or "")
+    p = dict(wf, name=name, branch=o.get("branch") or "", issue_repo="")
     notes = []
-    for k in ("agent", "skill", "model", "window", "repo", "files", "worktree"):
+    for k in ("agent", "skill", "model", "effort", "window", "repo", "files", "worktree"):
         if o.get(k) is not None:
             p[k] = o[k]
+    p["effort"] = p["effort"].lower()
     if p["agent"] != wf["agent"] and o.get("model") is None:
         p["model"] = ""  # the default model is the old agent's (Copilot ids are not Claude ids)
+    if p["agent"] != wf["agent"] and o.get("effort") is None:
+        p["effort"] = ""  # same for the effort: what a level means depends on the agent and its model
     if p["agent"] not in agents:
         raise Fail(f"agent '{p['agent']}' is not defined (have: {', '.join(agents)})")
     check_skill(agents, p["agent"], p["skill"], f"workflow '{name}'")
@@ -379,13 +438,18 @@ def make_plan(name, wfs, agents, o):
         raise Fail(f"files folder does not exist: {p['files']} (create it, or fix `files:`; only the case folder is created for you)")
     if not (p["repo"] or p["files"]):
         raise Fail("needs a repo, a files folder, or both")
-    case = expand_case(o["case"] if o.get("case") is not None else wf["case"], p["files"])
+    case, issue_checkout = expand_case(o["case"] if o.get("case") is not None else wf["case"], p["files"]), ""
     if wf["key"]:  # normalise first: a pasted URL holds slashes that a plain folder name must not
         if not case.strip():
             raise Fail(f"'{name}' needs its {wf['case_label']} (--case)")
         issues_repo = (settings.get("issues") or "").rsplit("/", 1)[-1] if wf["workspaces"] else None
-        case = normalize_key(wf["key"], case, wf["case_label"], issues_repo)
-    case = clean_case(case)
+        case, other_repo = key_info(wf["key"], case, wf["case_label"], issues_repo, bool(wf["key_repo_root"]))
+        if wf["key_repo_root"] and other_repo:  # an issue in another repo (an epic's docs repo): its checkout and full name
+            p["issue_repo"], issue_checkout = resolve_repo(other_repo, norm(wf["key_repo_root"]))
+            if not issue_checkout:
+                notes.append(f"no checkout of {p['issue_repo'] or other_repo + '-*'} under {short(norm(wf['key_repo_root']))}: "
+                             "clone it there to give the session its files" + ("" if p["issue_repo"] else " (and paste the issue URL, so the skill gets the full repo name)"))
+    case = "/".join(clean_case(part) for part in case.split("/")) if wf["key_repo_root"] else clean_case(case)  # nested keys: `repo/number`
     if case and not p["files"]:
         raise Fail("a case needs a files folder to live in")
     p["case"] = case
@@ -402,25 +466,40 @@ def make_plan(name, wfs, agents, o):
         if p["model"]:  # only the workflow's default: yield to the worktree, visibly
             notes.append(f"default model '{p['model']}' ignored: workmux add has no model flag")
             p["model"] = ""
+        if o.get("effort"):
+            raise Fail("--effort cannot be combined with a worktree (workmux add has no effort flag)")
+        if p["effort"]:
+            notes.append(f"default effort '{p['effort']}' ignored: workmux add has no effort flag")
+            p["effort"] = ""
         if not p["branch"]:
             raise Fail(f"'{name}' creates a worktree and needs a branch (--branch)")
     else:
         if p["branch"]:
             raise Fail("a branch only applies to a worktree (add --worktree)")
-        p["window"] = p["window"] or f"{name.split()[-1]}-{case or f'{datetime.datetime.now():%H%M}'}"
+        p["window"] = p["window"] or f"{name.split()[-1]}-{case.replace('/', '-') or f'{datetime.datetime.now():%H%M}'}"
 
+    extra_dirs = list(p["extra_dirs"])
+    if issue_checkout:
+        extra_dirs.append(issue_checkout)
     extra = []
-    for d in map(norm, p["extra_dirs"]):
+    for d in map(norm, extra_dirs):
         if not os.path.isdir(d):
             raise Fail(f"extra dir does not exist: {d}")
         if d != p["cwd"]:
             extra.append(d)
 
     kind = agent_kind(agents[p["agent"]])
+    if p["effort"] and kind not in EFFORT_FLAG:
+        if o.get("effort"):
+            raise Fail(f"agent '{p['agent']}' has no effort flag (only {', '.join(EFFORT_FLAG)} do)")
+        notes.append(f"default effort '{p['effort']}' ignored: '{p['agent']}' has no effort flag")
+        p["effort"] = ""
+    elif p["effort"] and p["effort"] not in EFFORTS[kind]:
+        raise Fail(f"effort '{p['effort']}' is not valid for {kind} (use {', '.join(EFFORTS[kind])})")
     if o.get("prompt") is not None:
         prompt = o["prompt"]
     else:
-        arg = " ".join(filter(None, [case if wf["case_arg"] else "", f"epic={p['workspace']}" if wf["workspaces"] else ""]))
+        arg = " ".join(filter(None, [case if wf["case_arg"] else "", f"epic={p['workspace']}" if wf["workspaces"] else "", f"repo={p['issue_repo']}" if p["issue_repo"] else ""]))
         prompt = f"/{p['skill']}" + (f" {arg}" if arg else "") if p["skill"] else ""
     off = skill_switched_off(agents[p["agent"]], p["skill"]) if prompt.startswith(f"/{p['skill']}") else None
     if off:
@@ -448,8 +527,8 @@ def make_plan(name, wfs, agents, o):
 
 # ---------------------------------------------------------------- what to run
 
-def agent_line(agents, agent, model, prompt="", extra=()):
-    """`env K=V ... <command> [prompt] <args> [--model M]`, the same shape workmux types into a pane.
+def agent_line(agents, agent, model, prompt="", extra=(), effort=""):
+    """`env K=V ... <command> [prompt] <args> [--model M] [--effort E]`, the same shape workmux types into a pane.
     Claude takes the prompt as its first positional argument and must get it BEFORE --add-dir, which
     swallows every following value. Copilot takes -i, OpenCode --prompt."""
     a = agents[agent]
@@ -462,7 +541,7 @@ def agent_line(agents, agent, model, prompt="", extra=()):
             skip = True  # drop the agent's own `--model X` pair; the override replaces it
         elif not (model and x.startswith("--model=")):
             args.append(x)
-    tail = (["--model", model] if model else [])
+    tail = (["--model", model] if model else []) + ([EFFORT_FLAG[kind], effort] if effort and kind in EFFORT_FLAG else [])
     adds = [x for d in extra for x in ("--add-dir", d)]
     if kind == "claude":
         argv = [str(a["command"]), *([prompt] if prompt else []), *args, *tail, *adds]
@@ -490,7 +569,7 @@ def summary(p, agents, switch=True):
     wt = p["worktree"]
     head = f"[{p['name']}] session {p['session']}" + ("" if wt else f" | window {p['window']}")
     out = [head] + [f"  note: {n}" for n in p["notes"]]
-    out.append(f"  agent  {p['agent']}" + (f" ({p['model']})" if p["model"] else ""))
+    out.append(f"  agent  {p['agent']}" + (f" ({p['model']})" if p["model"] else "") + (f", effort {p['effort']}" if p["effort"] else ""))
     out.append("  skill  " + (p["prompt"] if p["prompt"] else (f"{p['skill']} (not started automatically)" if p["skill"] else "(none)")))
     out.append(f"  starts {short(p['cwd'])}" + ("  -> new worktree off it" if wt else ""))
     if p.get("workspace"):
@@ -503,7 +582,7 @@ def summary(p, agents, switch=True):
     if p["extra"]:
         out.append("  also   " + ", ".join(map(short, p["extra"])))
     out.append("  run    " + (f"cd {short(p['cwd'])} && {shlex.join(worktree_argv(p, switch))}" if wt
-                              else agent_line(agents, p["agent"], p["model"], p["prompt"], p["extra"])))
+                              else agent_line(agents, p["agent"], p["model"], p["prompt"], p["extra"], p["effort"])))
     return "\n".join(out)
 
 
@@ -590,7 +669,7 @@ def start_window(p, agents, dry, switch, show=True):
             else:
                 print(f"  note: could not find the right-hand pane; it stays in the worktree (files: {p['case_dir']})")
         return
-    line = agent_line(agents, p["agent"], p["model"], p["prompt"], p["extra"])
+    line = agent_line(agents, p["agent"], p["model"], p["prompt"], p["extra"], p["effort"])
     win, pane = tmux("new-window", "-P", "-F", "#{window_id} #{pane_id}",
                      "-t", f"={s}:", "-n", p["window"], "-c", cwd).split()
     tmux("send-keys", "-t", pane, "-l", line)
@@ -603,8 +682,8 @@ def start_window(p, agents, dry, switch, show=True):
 # ---------------------------------------------------------------- the popup
 
 def cols(*c):
-    """workflow, agent, model, skill, wt, repo, files: the last column is not padded."""
-    widths = (14, 15, 17, 30, 3, 26)
+    """workflow, agent, model, effort, skill, wt, repo, files: the last column is not padded."""
+    widths = (14, 15, 17, 6, 30, 3, 26)
     return " ".join(f"{x:<{w}}" for x, w in zip(c, widths)) + " " + c[len(widths)]
 
 
@@ -615,7 +694,8 @@ def pick(wfs):
         if w["hidden"]:
             continue
         model = "-" if w["worktree"] else (w["model"] or "(default)")
-        rows.append(cols(n, w["agent"], model, w["skill"] or "-", "yes" if w["worktree"] else "no",
+        effort = "-" if w["worktree"] else (w["effort"] or "(def)")
+        rows.append(cols(n, w["agent"], model, effort, w["skill"] or "-", "yes" if w["worktree"] else "no",
                          short(norm(w["repo"])) or "-", short(norm(w["files"] or w["workspaces"])) or "-"))
     # Columns are space-padded; two+ spaces end the first field, so --nth=1 matches the workflow
     # name only (typing "bet" must not fuzzy-match a path or agent column). --tiebreak=index: on a
@@ -624,7 +704,7 @@ def pick(wfs):
         ["fzf", "--delimiter=\\s{2,}", "--nth=1", "--tiebreak=index", "--expect=tab", "--layout=reverse",
          "--info=hidden", "--prompt=workflow> ",
          "--header=enter: launch with defaults    tab: edit fields    esc: cancel\n"
-                   + cols("workflow", "agent", "model", "skill", "wt", "repo", "files")],
+                   + cols("workflow", "agent", "model", "effort", "skill", "wt", "repo", "files")],
         input="\n".join(rows), text=True, stdout=subprocess.PIPE)
     if r.returncode in (1, 130):
         return None
@@ -722,6 +802,19 @@ def names_completer(root, newest=False, need=None):
     """Completes one flat name from the folders under root (existing cases, installed skills)."""
     def complete(text):
         return "", text, list_names(root, hidden=text.startswith("."), newest=newest, need=need) if root else [], ""
+    return complete
+
+
+def case_completer(root):
+    """Existing cases of a nested workflow, newest first: `65755`, and `pdp-3517/153` for an issue in another repo."""
+    def complete(text):
+        names = []
+        for top in list_names(root, newest=True):
+            if top[0].isalpha():  # a repo folder: its cases are the numbers inside
+                names += [f"{top}/{n}" for n in list_names(os.path.join(root, top), newest=True)]
+            else:
+                names.append(top)
+        return "", text, names, ""
     return complete
 
 
@@ -879,7 +972,7 @@ def ask_case(wf, root, issues=""):
     """The case field. A workflow with a `key:` re-asks until the answer is a valid key (shown in its
     canonical spelling), so a typo costs one line, not the whole launch. An epic's task field offers no Tab list:
     the folders under the epic are not tasks."""
-    complete = None if wf["workspaces"] else names_completer(root, newest=True)
+    complete = None if wf["workspaces"] else (case_completer(root) if wf["key_repo_root"] else names_completer(root, newest=True))
     if not wf["key"]:
         return ask(wf["case_label"] + " (empty = none)", expand_case(wf["case"], root), complete)
     issues_repo = (issues or "").rsplit("/", 1)[-1] if wf["workspaces"] else None
@@ -887,11 +980,11 @@ def ask_case(wf, root, issues=""):
     while True:
         answer = ask(wf["case_label"], default, complete)
         try:
-            key = normalize_key(wf["key"], answer, wf["case_label"], issues_repo)
+            key = normalize_key(wf["key"], answer, wf["case_label"], issues_repo, bool(wf["key_repo_root"]))
             if key:
                 if key != answer:
                     print(f"  -> {key}")
-                return key
+                return answer.strip()  # as typed: a pasted URL still names the full repo when the launch re-reads it
             print(f"  {wf['case_label']} is required")
         except Fail as e:
             print(f"  {e}")
@@ -941,6 +1034,14 @@ def edit(wf, agents, o):
         same = o["agent"] == wf["agent"]  # the workflow's model belongs to its own agent
         o["model"] = ask("model (empty = harness default)" if same else "model (agent changed: harness default)",
                          wf["model"] if same else "")
+        kind = agent_kind(agents[o["agent"]])
+        if kind in EFFORT_FLAG:
+            while True:
+                o["effort"] = ask(f"effort ({', '.join(EFFORTS[kind])}; empty = harness default)"
+                                  if same else "effort (agent changed: harness default)", wf["effort"] if same else "").lower()
+                if not o["effort"] or o["effort"] in EFFORTS[kind]:
+                    break
+                print(f"  {kind} has: {', '.join(EFFORTS[kind])}")
         o["window"] = ask("window name (empty = auto)", wf["window"])
     else:
         o["window"] = ask("window name (empty = branch name)", wf["window"])
@@ -952,7 +1053,7 @@ def edit(wf, agents, o):
 def run(args):
     agents, wfs = load()
     name = " ".join(args.workflow)
-    o = {k: getattr(args, k) for k in ("agent", "skill", "model", "repo", "files", "case", "branch", "prompt", "worktree")}
+    o = {k: getattr(args, k) for k in ("agent", "skill", "model", "effort", "repo", "files", "case", "branch", "prompt", "worktree")}
     o["window"] = args.name
     if not name:
         chosen = pick(wfs)
@@ -984,6 +1085,8 @@ def main():
     ap = argparse.ArgumentParser(description="Start an agent window for a workflow (see module docstring).")
     ap.add_argument("workflow", nargs="*", help='e.g. review; omit to open the picker')
     ap.add_argument("--agent"), ap.add_argument("--model"), ap.add_argument("--name", help="window name")
+    ap.add_argument("--effort", help="reasoning effort (low|medium|high|xhigh|max; Copilot also none|minimal); "
+                                     "empty = the harness default")
     ap.add_argument("--skill", help="skill to start (empty = none)")
     ap.add_argument("--repo", help="git repo the agent works in; a worktree branches off it")
     ap.add_argument("--files", help="folder that holds the cases; the right-hand pane opens in <files>/<case>. "

@@ -12,6 +12,11 @@
 #           there, so profiles never drift). Typos are a load error, not a runtime surprise.
 #   model   passed as `--model <model>`; empty = the harness' own default. workmux add has no model
 #           flag, so with a worktree the default is ignored (with a note) and an explicit --model errors.
+#   effort  reasoning effort for the session: low | medium | high | xhigh | max (Copilot also none | minimal).
+#           Passed as `--effort <level>` to Claude and `--reasoning-effort <level>` to Copilot; empty = the
+#           harness' own `effortLevel` setting (both are "high" today). Which levels work depends on the
+#           model. OpenCode has no such flag and a worktree has no way to pass one (workmux add), so there
+#           the default is ignored with a note. Tab flow: asked right after the model. CLI: --effort.
 #   skill   started as the agent's first prompt: `/<skill> <case>`. Must be installed for that agent
 #           (Claude: ~/.claude/skills, Copilot: ~/.copilot/skills), otherwise it is a load error.
 #           Empty = no first prompt.
@@ -56,6 +61,18 @@
 #                              <session>`, run from `repo`. Asks for the branch. The Tab flow can switch it
 #                              on or off for a single launch whenever a repo is set. workmux opens its own
 #                              shell pane in the worktree; the launcher moves it to the case folder.
+#   key_repo_root  for a GitHub `key` whose issue may live in another repo (change: the epic's docs repo, the code
+#           stays in `repo`): the folder that holds the checkouts, e.g. ~/dev/camunda. It NESTS the key:
+#             camunda/camunda#65755            65755                 folder <files>/65755           window change-65755
+#             camunda/pdp-3517-variable-trace#153   pdp-3517/153     folder <files>/pdp-3517/153    window change-pdp-3517-153
+#           The repo goes by its SHORT name (everything after the first `<letters>-<digits>` is dropped:
+#           pdp-3517-variable-trace -> pdp-3517; a repo without that prefix, dmn-scala, keeps its name). Typed or
+#           pasted: 65755 | the issue URL | repo#153 | pdp-3517/153 (the folder path). The first prompt becomes
+#           `/<skill> pdp-3517/153 repo=<full repo name>`. The full name comes from the URL or full name typed, else
+#           from the checkout `<root>/pdp-3517` or the one `<root>/pdp-3517-*` (several = an error, paste the URL).
+#           That checkout is added to the agent's folders (like extra_dirs). No checkout = a note, no error.
+#           Tab in the case field lists the existing cases, `65755` and `pdp-3517/153` alike. Other workflows keep
+#           the flat key `repo-153`.
 #   extra_dirs  more folders the agent may use (--add-dir), e.g. the code checkout for a workflow that
 #               starts in its case folder. Not passed for worktrees (workmux builds that command).
 #   session   tmux session; default = the first word of the workflow name.
@@ -76,10 +93,12 @@ workflows:
   change:                              # plan stage: Copilot in the main checkout, no worktree
     agent: copilot
     model: claude-sonnet-5.5
+    effort: xhigh                      # planning is where depth pays off; the other workflows keep the harness default for now
     skill: change-companion
     repo: ~/dev/camunda/camunda        # worktree off it is optional (Tab flow)
     files: ~/.local/share/camunda/change-companion    # <issue number>/
     key: github-issue:camunda/camunda
+    key_repo_root: ~/dev/camunda       # an issue in the epic's docs repo (pdp-...-153) adds ~/dev/camunda/pdp-... too
     case_label: GitHub issue
     ask: [case]
 
