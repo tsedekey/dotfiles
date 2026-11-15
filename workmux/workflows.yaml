@@ -38,6 +38,12 @@
 #           skill finds its PR from the branch, so nothing is asked. Set `session` to put it next to the case's other
 #           windows. The window is tagged @launcher_here, so finish-window (prefix + F) closes only it, never the worktree.
 #           CLI: `--here <dir>` names the checkout (scripts, dry runs). Excludes worktree, repo, files, workspaces, key, case, ask.
+#   backports  true = the case is a PR number in the key's repo (the ORIGINAL merged PR, or one backport PR). The launcher looks
+#           up the open DRAFT backport PRs the backport action opened because of a conflict (head `backport-<N>-to-stable/<X.Y>`)
+#           and starts one worktree window per PR: `workmux add <head> --pr <number>` checks the PR's branch out under that exact
+#           name, with its upstream set, and the skill runs there. Clean backports are not drafts and are skipped; so is a target
+#           that is not stable/X.Y. Needs worktree: true, a repo and a github-pr key; asks only for the case. Windows are
+#           named `backport-<N>-<X.Y>`. CLI: `launcher.py backport --case 67612 [--dry-run]`.
 #   reuse   true = launching again, when the window `<window>` is already open in the session, switches to
 #           it and starts nothing (no second agent, no new folder). Default false: every launch opens a
 #           new window. Plain windows only; a worktree already has `workmux add`'s own handling.
@@ -150,6 +156,17 @@ workflows:
     skill: ci-babysit
     case_arg: false
     reuse: true
+
+  backport:                            # draft backport PRs that hit a conflict: one worktree window per PR
+    backports: true
+    worktree: true
+    agent: claude                      # --agent claude-safe makes it ask before each write and push; backport-resolve pushes to the backport branch
+    skill: backport-resolve
+    repo: ~/dev/camunda/camunda
+    key: github-pr:camunda/camunda
+    case_label: original PR
+    case_arg: false                    # the skill reads the PR from the branch it is started on
+    ask: [case]
 
   investigate:
     agent: claude
