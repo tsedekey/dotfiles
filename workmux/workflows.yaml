@@ -33,6 +33,11 @@
 #   case_label  what the prompt calls the case ("PR number").
 #   case_arg  false = start the skill WITHOUT the case (`/<skill>`), for a skill that takes no argument.
 #           Default true: `/<skill> <case>`. The case still names the folder and the window.
+#   here    true = no repo, files or case: the agent starts in the git checkout of the pane you pressed prefix + N in
+#           (a PR's worktree window). The window is `<workflow>-<number in the branch>` (feat/153-x -> triage-153) and the
+#           skill finds its PR from the branch, so nothing is asked. Set `session` to put it next to the case's other
+#           windows. The window is tagged @launcher_here, so finish-window (prefix + F) closes only it, never the worktree.
+#           CLI: `--here <dir>` names the checkout (scripts, dry runs). Excludes worktree, repo, files, workspaces, key, case, ask.
 #   reuse   true = launching again, when the window `<window>` is already open in the session, switches to
 #           it and starts nothing (no second agent, no new folder). Default false: every launch opens a
 #           new window. Plain windows only; a worktree already has `workmux add`'s own handling.
@@ -129,6 +134,22 @@ workflows:
     case_label: PR number
     ask: [case]
     extra_dirs: [~/dev/camunda/camunda]
+
+  triage:                              # review comments on the PR of the worktree you launch it from
+    session: change                    # beside the plan and the driver of the same change
+    here: true
+    agent: copilot
+    skill: pr-triage                   # user-level skill (~/.claude/skills/pr-triage, symlinked for Copilot)
+    case_arg: false                    # the skill takes no argument: it finds the PR from the branch
+    reuse: true                        # launching again goes back to triage-<n> instead of opening a second one
+
+  babysit:                             # CI on the PR of the worktree you launch it from (still one manual tick at a time)
+    session: change
+    here: true
+    agent: copilot
+    skill: ci-babysit
+    case_arg: false
+    reuse: true
 
   investigate:
     agent: claude

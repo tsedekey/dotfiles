@@ -26,6 +26,10 @@ case folder is <files>/pdp-3517/153, the window change-pdp-3517-153, and the pro
 The epic workflow is the exception: it asks WHICH epic first (`workspaces:`, the one launched last is offered),
 and the key is a task issue of that epic; the task has no folder of its own (see workflows.yaml).
 The agent starts in the repo (or its new worktree) when there is one, otherwise in the case folder.
+`here: true` (triage, babysit): no repo, files or case. The agent starts in the git checkout of the pane the popup was
+opened over (its worktree), the window is `<workflow>-<number in the branch name>` (triage-153), and the skill finds the
+PR from the branch. `--here <dir>` names the checkout instead (scripts, dry runs). The window is tagged so
+finish-window.py (prefix + F) closes only that window and never the worktree's own.
 `reuse: true` (daily): launching again switches to the window that is already open instead of starting a
 second one; `case_arg: false` keeps the case out of the skill's prompt.
 The session is the workflow's first word and is created when missing.  Every window is monitored
@@ -50,7 +54,7 @@ os.environ["PATH"] = f"{HOME}/.local/bin:/opt/homebrew/bin:{os.environ.get('PATH
 WORKFLOWS = os.environ.get("LAUNCHER_WORKFLOWS", f"{HOME}/dotfiles/workmux/workflows.yaml")
 AGENTS_CONFIG = os.environ.get("LAUNCHER_AGENTS_CONFIG", f"{HOME}/.config/workmux/config.yaml")
 FIELDS = {"worktree", "session", "agent", "model", "effort", "key_repo_root", "skill", "repo", "files", "workspaces", "case", "case_label",
-          "key", "ask", "extra_dirs", "hidden", "window", "reuse", "case_arg"}
+          "key", "ask", "extra_dirs", "hidden", "window", "reuse", "case_arg", "here"}
 ASKABLE = {"epic", "case", "repo"}  # fields a workflow can make the plain Enter flow ask for
 SPLIT = "30%"  # shell pane BESIDE the agent (right), like workmux's `split: horizontal` layout; was 20%, widened by half
 
@@ -342,7 +346,7 @@ def load():
             raise Fail(f"{where}: `dir` was split into `repo` (the git repo) and `files` (where the session's files live)")
         if set(w) - FIELDS:
             raise Fail(f"{where}: unknown field(s) {sorted(set(w) - FIELDS)}; allowed {sorted(FIELDS)}")
-        for flag, default in (("worktree", False), ("hidden", False), ("reuse", False), ("case_arg", True)):
+        for flag, default in (("worktree", False), ("hidden", False), ("reuse", False), ("case_arg", True), ("here", False)):
             w[flag] = w.get(flag, default)
             if not isinstance(w[flag], bool):
                 raise Fail(f"{where}: {flag} must be true or false, not {w[flag]!r}")
@@ -352,6 +356,8 @@ def load():
             raise Fail(f"{where}: agent '{w.get('agent')}' is not in {AGENTS_CONFIG} (have: {', '.join(agents)})")
         for k in ("repo", "files", "workspaces", "skill", "model", "effort", "key_repo_root", "window", "case", "case_label", "key"):
             w[k] = w.get(k) or ""
+        if w["here"] and (w["worktree"] or w["repo"] or w["files"] or w["workspaces"] or w["key"] or w["case"] or w.get("ask")):
+            raise Fail(f"{where}: `here` starts in the checkout of the pane you launch from, so it excludes worktree, repo, files, workspaces, key, case and ask")
         w["effort"] = str(w["effort"]).lower()
         if w["effort"] and w["effort"] not in set().union(*EFFORTS.values()):
             raise Fail(f"{where}: effort '{w['effort']}' is not one of {', '.join(EFFORTS['copilot'])}")
@@ -372,7 +378,7 @@ def load():
         w["extra_dirs"] = list(w.get("extra_dirs") or [])
         if set(w["ask"]) - ASKABLE:
             raise Fail(f"{where}: `ask` can hold {sorted(ASKABLE)}, not {sorted(set(w['ask']) - ASKABLE)}")
-        if not (w["repo"] or w["files"] or w["workspaces"]):
+        if not (w["repo"] or w["files"] or w["workspaces"] or w["here"]):
             raise Fail(f"{where}: needs a `repo`, a `files` folder, or both")
         if w["worktree"] and not (w["repo"] or w["workspaces"]):
             raise Fail(f"{where}: worktree: true needs a `repo` to branch from")
@@ -388,6 +394,36 @@ def workmux_prompt_is_ignored(repo):
     git-ignored it would show up as a dirty file (and `git add -A` would commit it), so no prompt then."""
     r = subprocess.run(["git", "-C", repo, "check-ignore", "-q", ".workmux/PROMPT-launcher.md"], capture_output=True)
     return r.returncode == 0
+
+
+def here_checkout(o):
+    """(top-level folder, branch) of the git checkout a `here` workflow starts in: `--here <dir>`, else the pane the
+    popup was opened over ($TMUX_PANE, then the window's other panes, as finish-window.py looks), else a loud failure."""
+    if o.get("here"):
+        cands = [norm(o["here"])]
+    else:
+        pane = os.environ.get("TMUX_PANE")
+        if not pane:
+            raise Fail("a `here` workflow starts where you are: open the launcher with prefix + N from the worktree's window, or pass --here <dir>")
+        rows = [r.split("\t") for r in tmux("list-panes", "-t", tmux("display-message", "-p", "-t", pane, "#{window_id}"),
+                                            "-F", "#{pane_id}\t#{pane_current_command}\t#{pane_current_path}").splitlines()]
+        rows = [r for r in rows if r[1] != "workmux"]  # the sidebar is never where work happens
+        cands = [r[2] for r in sorted(rows, key=lambda r: r[0] != pane)]  # the pane you pressed prefix + N in first
+    for d in cands:
+        top = subprocess.run(["git", "-C", d, "rev-parse", "--show-toplevel"], capture_output=True, text=True)
+        if top.returncode:
+            continue
+        branch = subprocess.run(["git", "-C", top.stdout.strip(), "rev-parse", "--abbrev-ref", "HEAD"], capture_output=True, text=True).stdout.strip()
+        if branch and branch != "HEAD":
+            return top.stdout.strip(), branch
+    raise Fail("no git checkout on a branch where you launched from (looked at: " + (", ".join(map(short, cands)) or "nothing")
+               + "). Press prefix + N in the worktree's agent pane, or pass --here <dir>.")
+
+
+def branch_slug(branch):
+    """What names the window: the first issue-like number in the branch (feat/153-x -> 153), else the branch itself."""
+    m = re.search(r"\d{3,}", branch)
+    return m.group(0) if m else re.sub(r"[^A-Za-z0-9._-]+", "-", branch).strip("-")[:30]
 
 
 def make_plan(name, wfs, agents, o):
@@ -431,6 +467,9 @@ def make_plan(name, wfs, agents, o):
         # an epic that had no epic.yaml and was just asked for its repos: saved once the launch succeeds
         p["new_settings"] = o.get("epic_settings") if o.get("epic_settings") and not os.path.exists(os.path.join(ws, SETTINGS_FILE)) else None
 
+    if wf["here"]:
+        p["repo"], p["here_branch"] = here_checkout(o)
+        p["window"] = p["window"] or f"{name.split()[-1]}-{branch_slug(p['here_branch'])}"
     p["repo"], p["files"] = norm(p["repo"]), norm(p["files"])
     if p["repo"] and not os.path.isdir(p["repo"]):
         raise Fail(f"repo does not exist: {p['repo']}")
@@ -571,7 +610,7 @@ def summary(p, agents, switch=True):
     out = [head] + [f"  note: {n}" for n in p["notes"]]
     out.append(f"  agent  {p['agent']}" + (f" ({p['model']})" if p["model"] else "") + (f", effort {p['effort']}" if p["effort"] else ""))
     out.append("  skill  " + (p["prompt"] if p["prompt"] else (f"{p['skill']} (not started automatically)" if p["skill"] else "(none)")))
-    out.append(f"  starts {short(p['cwd'])}" + ("  -> new worktree off it" if wt else ""))
+    out.append(f"  starts {short(p['cwd'])}" + ("  -> new worktree off it" if wt else "") + (f"  (branch {p['here_branch']}, the checkout you launched from)" if p.get("here_branch") else ""))
     if p.get("workspace"):
         out.append(f"  epic   {p['workspace']}" + ("  (epic.yaml is saved with the launch)" if p.get("new_settings") else ""))
     if p["reuse"] and not wt:
@@ -672,6 +711,8 @@ def start_window(p, agents, dry, switch, show=True):
     line = agent_line(agents, p["agent"], p["model"], p["prompt"], p["extra"], p["effort"])
     win, pane = tmux("new-window", "-P", "-F", "#{window_id} #{pane_id}",
                      "-t", f"={s}:", "-n", p["window"], "-c", cwd).split()
+    if p.get("here"):  # a side window on someone else's worktree: finish-window must close only this window
+        tmux("set-option", "-w", "-t", win, "@launcher_here", "1")
     tmux("send-keys", "-t", pane, "-l", line)
     tmux("send-keys", "-t", pane, "Enter")
     tmux("split-window", "-h", "-d", "-l", SPLIT, "-t", pane, "-c", p["pane_dir"])  # -h = side by side
@@ -696,7 +737,7 @@ def pick(wfs):
         model = "-" if w["worktree"] else (w["model"] or "(default)")
         effort = "-" if w["worktree"] else (w["effort"] or "(def)")
         rows.append(cols(n, w["agent"], model, effort, w["skill"] or "-", "yes" if w["worktree"] else "no",
-                         short(norm(w["repo"])) or "-", short(norm(w["files"] or w["workspaces"])) or "-"))
+                         "(this pane)" if w["here"] else (short(norm(w["repo"])) or "-"), short(norm(w["files"] or w["workspaces"])) or "-"))
     # Columns are space-padded; two+ spaces end the first field, so --nth=1 matches the workflow
     # name only (typing "bet" must not fuzzy-match a path or agent column). --tiebreak=index: on a
     # tie YAML order wins, so keep the workflow you launch most often above its siblings.
@@ -1053,7 +1094,7 @@ def edit(wf, agents, o):
 def run(args):
     agents, wfs = load()
     name = " ".join(args.workflow)
-    o = {k: getattr(args, k) for k in ("agent", "skill", "model", "effort", "repo", "files", "case", "branch", "prompt", "worktree")}
+    o = {k: getattr(args, k) for k in ("agent", "skill", "model", "effort", "repo", "files", "case", "branch", "prompt", "worktree", "here")}
     o["window"] = args.name
     if not name:
         chosen = pick(wfs)
@@ -1061,6 +1102,9 @@ def run(args):
             return
         name, want_edit = chosen
         wf = wfs[name]
+        if want_edit and wf["here"]:
+            print(f"\n  {name}: starts where you are, so there is nothing to edit here (use the CLI: --agent, --skill, --name, --here)")
+            want_edit = False
         if want_edit:
             print(f"\n  {name}:  Enter keeps the value   '-' clears it   Esc cancels")
             edit(wf, agents, o)
@@ -1096,6 +1140,7 @@ def main():
     ap.add_argument("--prompt", help="first prompt, instead of '/<skill> <case>'")
     ap.add_argument("--worktree", action=argparse.BooleanOptionalAction, default=None,
                     help="create a worktree (or not), overriding the workflow's default")
+    ap.add_argument("--here", help="for a `here` workflow: the checkout to start in (default: the pane the popup was opened over)")
     ap.add_argument("--dry-run", action="store_true", help="print what would run, change nothing")
     ap.add_argument("--no-switch", action="store_true", help="leave the client where it is")
     args = ap.parse_args()
