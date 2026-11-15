@@ -30,6 +30,11 @@ The agent starts in the repo (or its new worktree) when there is one, otherwise 
 opened over (its worktree), the window is `<workflow>-<number in the branch name>` (triage-153), and the skill finds the
 PR from the branch. `--here <dir>` names the checkout instead (scripts, dry runs). The window is tagged so
 finish-window.py (prefix + F) closes only that window and never the worktree's own.
+`backports: true` (backport): the case is a PR number in the key's repo, either the ORIGINAL merged PR or one backport PR.
+The launcher looks up the draft backport PRs the backport action opened because of a conflict (open, draft, head
+`backport-<N>-to-stable/<X.Y>`) and starts one worktree window per PR with `workmux add <head> --pr <number>`, which checks the
+PR's branch out, named exactly as `backport-resolve` expects, and runs the skill there. Clean backports are not drafts and are
+skipped. `--case <number>` works on the CLI, `--dry-run` prints every launch.
 `reuse: true` (daily): launching again switches to the window that is already open instead of starting a
 second one; `case_arg: false` keeps the case out of the skill's prompt.
 The session is the workflow's first word and is created when missing.  Every window is monitored
@@ -53,8 +58,11 @@ HOME = os.path.expanduser("~")
 os.environ["PATH"] = f"{HOME}/.local/bin:/opt/homebrew/bin:{os.environ.get('PATH', '')}"
 WORKFLOWS = os.environ.get("LAUNCHER_WORKFLOWS", f"{HOME}/dotfiles/workmux/workflows.yaml")
 AGENTS_CONFIG = os.environ.get("LAUNCHER_AGENTS_CONFIG", f"{HOME}/.config/workmux/config.yaml")
+GH = os.environ.get("LAUNCHER_GH", "gh")  # tests point these two at stand-ins
+WORKMUX = os.environ.get("LAUNCHER_WORKMUX", "workmux")
+BACKPORT_HEAD = re.compile(r"backport-(\d+)-to-(.+)")  # the backport action's branch: backport-<original PR>-to-<target branch>
 FIELDS = {"worktree", "session", "agent", "model", "effort", "key_repo_root", "skill", "repo", "files", "workspaces", "case", "case_label",
-          "key", "ask", "extra_dirs", "hidden", "window", "reuse", "case_arg", "here"}
+          "key", "ask", "extra_dirs", "hidden", "window", "reuse", "case_arg", "here", "backports"}
 ASKABLE = {"epic", "case", "repo"}  # fields a workflow can make the plain Enter flow ask for
 SPLIT = "30%"  # shell pane BESIDE the agent (right), like workmux's `split: horizontal` layout; was 20%, widened by half
 
@@ -346,7 +354,7 @@ def load():
             raise Fail(f"{where}: `dir` was split into `repo` (the git repo) and `files` (where the session's files live)")
         if set(w) - FIELDS:
             raise Fail(f"{where}: unknown field(s) {sorted(set(w) - FIELDS)}; allowed {sorted(FIELDS)}")
-        for flag, default in (("worktree", False), ("hidden", False), ("reuse", False), ("case_arg", True), ("here", False)):
+        for flag, default in (("worktree", False), ("hidden", False), ("reuse", False), ("case_arg", True), ("here", False), ("backports", False)):
             w[flag] = w.get(flag, default)
             if not isinstance(w[flag], bool):
                 raise Fail(f"{where}: {flag} must be true or false, not {w[flag]!r}")
@@ -358,6 +366,15 @@ def load():
             w[k] = w.get(k) or ""
         if w["here"] and (w["worktree"] or w["repo"] or w["files"] or w["workspaces"] or w["key"] or w["case"] or w.get("ask")):
             raise Fail(f"{where}: `here` starts in the checkout of the pane you launch from, so it excludes worktree, repo, files, workspaces, key, case and ask")
+        if w["backports"]:
+            if not (w["worktree"] and w["repo"]):
+                raise Fail(f"{where}: `backports` needs `worktree: true` and a `repo` (each backport PR gets a worktree off it)")
+            if not w["key"].startswith("github-pr"):
+                raise Fail(f"{where}: `backports` needs `key: github-pr:<owner>/<repo>` (the case is a PR number)")
+            if w["here"] or w["files"] or w["workspaces"] or w["case"] or w["window"]:
+                raise Fail(f"{where}: `backports` excludes here, files, workspaces, case and window (windows are named from the PRs)")
+            if "case" not in (w.get("ask") or []):
+                raise Fail(f"{where}: `backports` needs `ask: [case]`")
         w["effort"] = str(w["effort"]).lower()
         if w["effort"] and w["effort"] not in set().union(*EFFORTS.values()):
             raise Fail(f"{where}: effort '{w['effort']}' is not one of {', '.join(EFFORTS['copilot'])}")
@@ -382,7 +399,7 @@ def load():
             raise Fail(f"{where}: needs a `repo`, a `files` folder, or both")
         if w["worktree"] and not (w["repo"] or w["workspaces"]):
             raise Fail(f"{where}: worktree: true needs a `repo` to branch from")
-        if (w["case"] or "case" in w["ask"]) and not (w["files"] or w["workspaces"]):
+        if (w["case"] or "case" in w["ask"]) and not (w["files"] or w["workspaces"] or w["backports"]):
             raise Fail(f"{where}: a case needs a `files` folder to live in")
         check_skill(agents, w["agent"], w["skill"], where)
         w["session"] = w.get("session") or name.split()[0]
@@ -421,7 +438,12 @@ def here_checkout(o):
 
 
 def branch_slug(branch):
-    """What names the window: the first issue-like number in the branch (feat/153-x -> 153), else the branch itself."""
+    """What names the window: the first issue-like number in the branch (feat/153-x -> 153), else the branch itself.
+    A backport branch carries one original PR for several targets, so its name keeps the target too
+    (backport-69172-to-stable/8.9 -> 69172-8.9): triage-69172 for the 8.8 and the 8.9 worktree would be the same window."""
+    b = BACKPORT_HEAD.fullmatch(branch)
+    if b:
+        return f"{b[1]}-{b[2].split('/', 1)[-1]}"
     m = re.search(r"\d{3,}", branch)
     return m.group(0) if m else re.sub(r"[^A-Za-z0-9._-]+", "-", branch).strip("-")[:30]
 
@@ -433,6 +455,11 @@ def make_plan(name, wfs, agents, o):
     wf = wfs[name]
     p = dict(wf, name=name, branch=o.get("branch") or "", issue_repo="")
     notes = []
+    if wf["backports"]:  # one plan per backport PR: its head branch is checked out with `workmux add --pr`
+        t = o.get("pr_target")
+        if not t:
+            raise Fail(f"'{name}' starts from a PR number: pass --case <number> (run_backports makes one plan per PR)")
+        p.update(branch=t["head"], pr=t["number"], pr_target=t, window=f"backport-{t['original']}-{t['target']}")
     for k in ("agent", "skill", "model", "effort", "window", "repo", "files", "worktree"):
         if o.get(k) is not None:
             p[k] = o[k]
@@ -489,11 +516,11 @@ def make_plan(name, wfs, agents, o):
                 notes.append(f"no checkout of {p['issue_repo'] or other_repo + '-*'} under {short(norm(wf['key_repo_root']))}: "
                              "clone it there to give the session its files" + ("" if p["issue_repo"] else " (and paste the issue URL, so the skill gets the full repo name)"))
     case = "/".join(clean_case(part) for part in case.split("/")) if wf["key_repo_root"] else clean_case(case)  # nested keys: `repo/number`
-    if case and not p["files"]:
+    if case and not p["files"] and not wf["backports"]:
         raise Fail("a case needs a files folder to live in")
     p["case"] = case
     # "" when there is no files folder; an epic's task gets no folder of its own
-    p["case_dir"] = os.path.join(p["files"], case) if case and not wf["workspaces"] else p["files"]
+    p["case_dir"] = "" if wf["backports"] else (os.path.join(p["files"], case) if case and not wf["workspaces"] else p["files"])
     p["cwd"] = p["repo"] or p["case_dir"]  # where the agent starts (the repo; a worktree is made from it)
     p["pane_dir"] = p["case_dir"] or p["cwd"]  # where the right-hand shell opens
 
@@ -593,7 +620,8 @@ def agent_line(agents, agent, model, prompt="", extra=(), effort=""):
 
 
 def worktree_argv(p, switch):
-    argv = ["workmux", "add", p["branch"], "-a", p["agent"], "--parent-session", p["session"]]
+    argv = [WORKMUX, "add", p["branch"]] + (["--pr", str(p["pr"]), "-o"] if p.get("pr") else [])  # -o: open the worktree if it already exists
+    argv += ["-a", p["agent"], "--parent-session", p["session"]]
     argv += ["--target-name", p["window"]] if p["window"] else []
     argv += ["-p", p["prompt"]] if p["prompt"] else []
     return argv + ([] if switch else ["-b"])
@@ -611,6 +639,9 @@ def summary(p, agents, switch=True):
     out.append(f"  agent  {p['agent']}" + (f" ({p['model']})" if p["model"] else "") + (f", effort {p['effort']}" if p["effort"] else ""))
     out.append("  skill  " + (p["prompt"] if p["prompt"] else (f"{p['skill']} (not started automatically)" if p["skill"] else "(none)")))
     out.append(f"  starts {short(p['cwd'])}" + ("  -> new worktree off it" if wt else "") + (f"  (branch {p['here_branch']}, the checkout you launched from)" if p.get("here_branch") else ""))
+    if p.get("pr"):
+        t = p["pr_target"]
+        out.append(f"  pr     #{t['number']} -> stable/{t['target']}, draft backport of #{t['original']}: {t['title'][:70]}")
     if p.get("workspace"):
         out.append(f"  epic   {p['workspace']}" + ("  (epic.yaml is saved with the launch)" if p.get("new_settings") else ""))
     if p["reuse"] and not wt:
@@ -1091,6 +1122,87 @@ def edit(wf, agents, o):
     o["case"] = ask_case(wf, "" if ws else norm(o["files"]), settings.get("issues", ""))
 
 
+def gh_json(*args):
+    r = subprocess.run([GH, *args], capture_output=True, text=True)
+    if r.returncode:
+        raise Fail(f"gh {' '.join(args[:2])}: {r.stderr.strip() or 'failed'}")
+    try:
+        return json.loads(r.stdout or "null")
+    except ValueError:
+        raise Fail(f"gh {' '.join(args[:2])} did not return JSON")
+
+
+def discover_backports(wf, text):
+    """([target, ...], [notes]) for a typed PR number: the open DRAFT backport PRs the action made for it.
+    The number may be the original (merged) PR or one backport PR. A clean backport is not a draft, and backport-resolve
+    only knows stable/X.Y targets, so those are listed in the notes and skipped."""
+    slug = wf["key"].partition(":")[2]
+    key, other = key_info(wf["key"], text, wf["case_label"], None, False)
+    if other:
+        raise Fail(f"backports are looked up in {slug} only (got a PR in {other})")
+    typed = gh_json("pr", "view", key, "-R", slug, "--json", "number,headRefName,isDraft,state,title")
+    m = BACKPORT_HEAD.fullmatch(typed["headRefName"])
+    if m:  # the typed number is itself a backport PR
+        original, cands = m[1], [typed]
+        if typed["state"] != "OPEN":
+            raise Fail(f"#{key} is {typed['state'].lower()}: nothing to resolve")
+    else:
+        original = key
+        cands = gh_json("pr", "list", "-R", slug, "--search", f"{key} in:body", "--state", "open",
+                        "--json", "number,headRefName,isDraft,title", "--limit", "50") or []
+    targets, notes = [], []
+    def version(c):  # stable/8.8 before stable/8.10: compare the numbers, not the text
+        return [int(x) for x in re.findall(r"\d+", c["headRefName"].split("-to-", 1)[-1])]
+    for pr in sorted(cands, key=version):
+        mm = BACKPORT_HEAD.fullmatch(pr["headRefName"])
+        if not mm or mm[1] != original:
+            continue
+        if not pr["isDraft"]:
+            notes.append(f"#{pr['number']} ({mm[2]}) is not a draft: it applied cleanly, skipped")
+        elif not mm[2].startswith("stable/"):
+            notes.append(f"#{pr['number']} targets {mm[2]}: backport-resolve only handles stable/X.Y, skipped")
+        else:
+            targets.append({"number": pr["number"], "head": pr["headRefName"], "original": original,
+                            "target": mm[2].split("/", 1)[1], "title": pr["title"]})
+    if not targets:
+        raise Fail(f"no conflicting draft backport PRs for #{original} in {slug}" +
+                   (": " + "; ".join(notes) if notes else ". Backports that applied cleanly are not drafts, and merged ones are done."))
+    return targets, notes
+
+
+def backport_window(session, window):
+    """The id of the window already open for this backport, or None. workmux turns dots into dashes in a window name
+    (backport-69172-8.8 -> backport-69172-8-8) and may put an icon in front, so compare the plain forms."""
+    r = subprocess.run(["tmux", "list-windows", "-t", f"={session}:", "-F", "#{window_id} #{window_name}"], capture_output=True, text=True)
+    want = {window, window.replace(".", "-")}
+    for line in r.stdout.splitlines() if not r.returncode else []:
+        wid, _, wname = line.partition(" ")
+        if re.sub(r"^[^A-Za-z0-9]+", "", wname) in want:
+            return wid
+    return None
+
+
+def run_backports(name, wfs, agents, o, args):
+    wf = wfs[name]
+    if not (o.get("case") or "").strip():
+        raise Fail(f"'{name}' needs the {wf['case_label']} (--case)")
+    targets, notes = discover_backports(wf, o["case"])
+    for n in notes:
+        print(f"  note: {n}")
+    print(f"  {len(targets)} conflicting draft backport PR(s): " + ", ".join(f"#{t['number']} (stable/{t['target']})" for t in targets))
+    for i, t in enumerate(targets):  # one window each; the client follows only the first
+        plan = make_plan(name, wfs, agents, dict(o, pr_target=t))
+        have = backport_window(plan["session"], plan["window"])
+        if have:  # `workmux add -o` on an open worktree adds another agent to the same window: two writers on one branch
+            note = f"already open: {plan['session']}:{plan['window']}"
+            if not args.dry_run and not args.no_switch and i == 0:
+                tmux("switch-client", "-t", have)
+                note += ", switched to it"
+            print(f"  {note} (not started again: a second agent in that worktree would push the same branch)")
+            continue
+        launch(plan, agents, args.dry_run, (not args.no_switch) and i == 0)
+
+
 def run(args):
     agents, wfs = load()
     name = " ".join(args.workflow)
@@ -1102,19 +1214,19 @@ def run(args):
             return
         name, want_edit = chosen
         wf = wfs[name]
-        if want_edit and wf["here"]:
-            print(f"\n  {name}: starts where you are, so there is nothing to edit here (use the CLI: --agent, --skill, --name, --here)")
+        if want_edit and (wf["here"] or wf["backports"]):
+            print(f"\n  {name}: its launches are worked out from {'where you are' if wf['here'] else 'the PR number'}, so there is nothing to edit here (use the CLI: --agent, --skill, --here)")
             want_edit = False
         if want_edit:
             print(f"\n  {name}:  Enter keeps the value   '-' clears it   Esc cancels")
             edit(wf, agents, o)
         wants_worktree = wf["worktree"] if o["worktree"] is None else o["worktree"]
-        needs_branch = wants_worktree and not o["branch"]
+        needs_branch = wants_worktree and not o["branch"] and not wf["backports"]
         if not want_edit and (wf["ask"] or needs_branch):
             print(f"\n  {name}:  Enter keeps the value   Esc cancels")
             quick(wf, o)
             wants_worktree = wf["worktree"] if o["worktree"] is None else o["worktree"]
-        if wants_worktree and not o["branch"]:
+        if wants_worktree and not o["branch"] and not wf["backports"]:
             o["branch"] = ask("branch (required)")
         if want_edit:  # edited by hand: show the result and let the user back out before anything exists
             plan = make_plan(name, wfs, agents, o)
@@ -1122,6 +1234,8 @@ def run(args):
             if not confirm_launch():
                 raise Cancelled
             return launch(plan, agents, args.dry_run, not args.no_switch, show=False)
+    if wfs.get(name, {}).get("backports"):  # an unknown name falls through to make_plan's friendly error
+        return run_backports(name, wfs, agents, o, args)
     launch(make_plan(name, wfs, agents, o), agents, args.dry_run, not args.no_switch)
 
 
