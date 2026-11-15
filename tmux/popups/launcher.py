@@ -413,15 +413,35 @@ def workmux_prompt_is_ignored(repo):
     return r.returncode == 0
 
 
+def origin_pane():
+    """The pane the launcher was opened over, or "". Run from a pane it is $TMUX_PANE. A tmux popup has no TMUX_PANE (tmux
+    sets it for panes only), so take the active pane of the client used most recently: the one hosting the popup, since
+    typing into the popup is its latest input. Outside tmux there is nothing to find, and it never guesses."""
+    pane = os.environ.get("TMUX_PANE")
+    if pane:
+        return pane
+    if not os.environ.get("TMUX"):
+        return ""
+    try:
+        rows = []
+        for line in tmux("list-clients", "-F", "#{client_activity} #{pane_id}").splitlines():
+            parts = line.split(None, 1)  # a malformed row is skipped, not fatal
+            if len(parts) == 2 and parts[0].isdigit() and parts[1].startswith("%"):
+                rows.append((int(parts[0]), parts[1].split()[0]))
+        return max(rows)[1] if rows else tmux("display-message", "-p", "#{pane_id}")
+    except Fail:
+        return ""
+
+
 def here_checkout(o):
     """(top-level folder, branch) of the git checkout a `here` workflow starts in: `--here <dir>`, else the pane the
-    popup was opened over ($TMUX_PANE, then the window's other panes, as finish-window.py looks), else a loud failure."""
+    launcher was opened over (origin_pane, then the window's other panes, as finish-window.py looks), else a loud failure."""
     if o.get("here"):
         cands = [norm(o["here"])]
     else:
-        pane = os.environ.get("TMUX_PANE")
+        pane = origin_pane()
         if not pane:
-            raise Fail("a `here` workflow starts where you are: open the launcher with prefix + N from the worktree's window, or pass --here <dir>")
+            raise Fail("a `here` workflow starts where you are: open the launcher with prefix + N from inside tmux, in the worktree's window, or pass --here <dir>")
         rows = [r.split("\t") for r in tmux("list-panes", "-t", tmux("display-message", "-p", "-t", pane, "#{window_id}"),
                                             "-F", "#{pane_id}\t#{pane_current_command}\t#{pane_current_path}").splitlines()]
         rows = [r for r in rows if r[1] != "workmux"]  # the sidebar is never where work happens
@@ -1075,6 +1095,20 @@ def quick(wf, o):
             o["repo"] = ask("repo (empty = none)", wf["repo"], path_completer)
 
 
+def ask_model_effort(wf, agents, o):
+    same = o["agent"] == wf["agent"]  # the workflow's model belongs to its own agent
+    o["model"] = ask("model (empty = harness default)" if same else "model (agent changed: harness default)",
+                     wf["model"] if same else "")
+    kind = agent_kind(agents[o["agent"]])
+    if kind in EFFORT_FLAG:
+        while True:
+            o["effort"] = ask(f"effort ({', '.join(EFFORTS[kind])}; empty = harness default)"
+                              if same else "effort (agent changed: harness default)", wf["effort"] if same else "").lower()
+            if not o["effort"] or o["effort"] in EFFORTS[kind]:
+                break
+            print(f"  {kind} has: {', '.join(EFFORTS[kind])}")
+
+
 def edit(wf, agents, o):
     ws = bool(wf["workspaces"])
     if ws:
@@ -1093,6 +1127,13 @@ def edit(wf, agents, o):
             break
         except Fail as e:
             print(f"  {e}")
+    if wf["here"]:  # starts in the checkout you are in: only the agent's settings and the window name are open
+        ask_model_effort(wf, agents, o)
+        o["window"] = ask("window name (empty = auto)", wf["window"])
+        return
+    if wf["backports"]:  # one worktree per draft backport PR, named from the PRs: the PR number is the one open question
+        o["case"] = ask_case(wf, "", "")
+        return
     o["repo"] = ask("repo (empty = none)", settings.get("repo", "") if ws else wf["repo"], path_completer)
     o["worktree"] = False
     if o["repo"]:
@@ -1103,17 +1144,7 @@ def edit(wf, agents, o):
             print("  answer y or n")
         o["worktree"] = answer.startswith("y")
     if not o["worktree"]:
-        same = o["agent"] == wf["agent"]  # the workflow's model belongs to its own agent
-        o["model"] = ask("model (empty = harness default)" if same else "model (agent changed: harness default)",
-                         wf["model"] if same else "")
-        kind = agent_kind(agents[o["agent"]])
-        if kind in EFFORT_FLAG:
-            while True:
-                o["effort"] = ask(f"effort ({', '.join(EFFORTS[kind])}; empty = harness default)"
-                                  if same else "effort (agent changed: harness default)", wf["effort"] if same else "").lower()
-                if not o["effort"] or o["effort"] in EFFORTS[kind]:
-                    break
-                print(f"  {kind} has: {', '.join(EFFORTS[kind])}")
+        ask_model_effort(wf, agents, o)
         o["window"] = ask("window name (empty = auto)", wf["window"])
     else:
         o["window"] = ask("window name (empty = branch name)", wf["window"])
@@ -1182,7 +1213,9 @@ def backport_window(session, window):
     return None
 
 
-def run_backports(name, wfs, agents, o, args):
+def run_backports(name, wfs, agents, o, args, review=False):
+    """Discover the draft backport PRs, plan one window each, and start them. review=True (the Tab flow) shows every
+    launch and waits for a confirmation first, like the other workflows' Tab flow does."""
     wf = wfs[name]
     if not (o.get("case") or "").strip():
         raise Fail(f"'{name}' needs the {wf['case_label']} (--case)")
@@ -1190,17 +1223,27 @@ def run_backports(name, wfs, agents, o, args):
     for n in notes:
         print(f"  note: {n}")
     print(f"  {len(targets)} conflicting draft backport PR(s): " + ", ".join(f"#{t['number']} (stable/{t['target']})" for t in targets))
+    plans, reopen = [], None
     for i, t in enumerate(targets):  # one window each; the client follows only the first
         plan = make_plan(name, wfs, agents, dict(o, pr_target=t))
         have = backport_window(plan["session"], plan["window"])
         if have:  # `workmux add -o` on an open worktree adds another agent to the same window: two writers on one branch
-            note = f"already open: {plan['session']}:{plan['window']}"
-            if not args.dry_run and not args.no_switch and i == 0:
-                tmux("switch-client", "-t", have)
-                note += ", switched to it"
-            print(f"  {note} (not started again: a second agent in that worktree would push the same branch)")
+            print(f"  already open: {plan['session']}:{plan['window']} (not started again: a second agent in that worktree would push the same branch)")
+            if i == 0:
+                reopen = have
             continue
-        launch(plan, agents, args.dry_run, (not args.no_switch) and i == 0)
+        plans.append((i, plan))
+    if review:
+        for i, plan in plans:
+            print("\n" + summary(plan, agents, (not args.no_switch) and i == 0))
+        if not plans:
+            return
+        if not confirm_launch():
+            raise Cancelled
+    if reopen and not args.dry_run and not args.no_switch:
+        tmux("switch-client", "-t", reopen)
+    for i, plan in plans:
+        launch(plan, agents, args.dry_run, (not args.no_switch) and i == 0, show=not review)
 
 
 def run(args):
@@ -1214,9 +1257,6 @@ def run(args):
             return
         name, want_edit = chosen
         wf = wfs[name]
-        if want_edit and (wf["here"] or wf["backports"]):
-            print(f"\n  {name}: its launches are worked out from {'where you are' if wf['here'] else 'the PR number'}, so there is nothing to edit here (use the CLI: --agent, --skill, --here)")
-            want_edit = False
         if want_edit:
             print(f"\n  {name}:  Enter keeps the value   '-' clears it   Esc cancels")
             edit(wf, agents, o)
@@ -1229,6 +1269,8 @@ def run(args):
         if wants_worktree and not o["branch"] and not wf["backports"]:
             o["branch"] = ask("branch (required)")
         if want_edit:  # edited by hand: show the result and let the user back out before anything exists
+            if wf["backports"]:
+                return run_backports(name, wfs, agents, o, args, review=True)
             plan = make_plan(name, wfs, agents, o)
             print("\n" + summary(plan, agents, not args.no_switch))
             if not confirm_launch():
