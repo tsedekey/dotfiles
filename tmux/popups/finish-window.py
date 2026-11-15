@@ -5,6 +5,8 @@ Picks the right close for what the window holds, shows it, and asks before doing
 
   plain window      tmux kill-window. (An agent that has exited needs nothing else; a running one is
                     ended by the hangup, its transcript is already on disk and resumable.)
+  `here` window     (triage, babysit: the launcher tags it @launcher_here) tmux kill-window; the worktree it
+                    sits in belongs to another window and is never touched.
   worktree window   merged and clean  -> workmux remove -f <handle>   (worktree + branch + window)
                     anything else     -> workmux close <handle>       (window only; worktree and
                                          branch stay, reopen with `workmux open <handle>`)
@@ -56,13 +58,13 @@ def tmux(*args):
 
 
 def window_info(wid):
-    session, name, nwin = tmux("display-message", "-p", "-t", wid,
-                               "#{session_name}\t#{window_name}\t#{session_windows}").split("\t")
+    session, name, nwin, here = tmux("display-message", "-p", "-t", wid,
+                                     "#{session_name}\t#{window_name}\t#{session_windows}\t#{?@launcher_here,1,0}").split("\t")
     panes = []
     for line in tmux("list-panes", "-t", wid, "-F", "#{pane_id}\t#{pane_current_command}\t#{pane_current_path}").splitlines():
         pid, cmd, path = line.split("\t")
         panes.append({"id": pid, "cmd": cmd, "path": path})
-    return {"id": wid, "session": session, "name": name, "windows": int(nwin), "panes": panes}
+    return {"id": wid, "session": session, "name": name, "windows": int(nwin), "panes": panes, "here": here == "1"}
 
 
 def agent_status():
@@ -176,6 +178,11 @@ def plan(win, status):
         lines.append(f"running pane {p['id']}: {p['cmd']}")
     if win["windows"] <= 1:
         raise Fail(f"'{win['name']}' is the only window in session '{win['session']}'; closing it would end the session.")
+    if win["here"]:  # a launcher `here` window (triage, babysit): it sits in a worktree that another window owns
+        lines.append("side window on a worktree (started by the launcher's `here` mode): only this window closes;")
+        lines.append("the worktree, its branch and its other windows are not touched")
+        return (f"Finish {win['session']}:{win['name']}", lines,
+                (["tmux", "kill-window", "-t", win["id"]], None), "close the window (tmux kill-window)")
     wt = find_worktree(win)
     if wt is None:
         lines.append("plain window: nothing on disk besides the agent's transcript")
