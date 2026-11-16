@@ -1,0 +1,2155 @@
+#!/usr/bin/env python3
+"""phone-hub: a phone-sized view of your workmux agents, served privately over your tailnet. It can read their screens, send them
+typed replies, press keys in their dialogs, and show a diff or an artifact for annotation. Everything that types into an agent is
+behind the PIN, a preview or confirm step, and rate limits (agents may run with permissions bypassed).
+
+  phone-hub serve            run the server (127.0.0.1 only; `tailscale serve` publishes it on the tailnet)
+  phone-hub ensure           start it detached if it is not answering (idempotent; tmux.conf calls this); it runs under
+                             a small supervisor that starts the server again if it ever dies
+  phone-hub restart          stop the server; the supervisor starts it again with the code on disk
+  phone-hub supervise        the restart loop itself (started by ensure; you do not run this)
+  phone-hub set-pin          set the login PIN (run it in YOUR terminal; it prompts, nothing is echoed)
+  phone-hub pair             print a one-time code that pairs ONE phone (valid 10 minutes)
+  phone-hub devices          list paired devices
+  phone-hub revoke ID        unpair a device (and end its sessions)
+  phone-hub off | on         kill switch: everything except /healthz answers 503 while it is off
+  phone-hub status           what is running, what is configured
+  phone-hub log [-n N]       last audit log lines
+  phone-hub selftest         read the agent list and one pane from THIS environment (no content printed)
+
+Design and threat model: ~/.local/share/general/plan-b-hub-v1-design.md. In short, every request must pass, in order:
+Host header, Tailscale identity header, device cookie (pairing), PIN session. Pane text is untrusted and always escaped;
+there is no JavaScript. Anything that types into an agent additionally needs a fresh PIN, a one-use preview, and a check that the
+screen still shows what you saw.
+
+First run: put your Tailscale login and this machine's tailnet name in config.json as "login" and "host" (no defaults: the hub refuses to start without them).
+Files: ~/.config/phone-hub/ (config.json, secrets.json mode 600) and ~/.local/state/phone-hub/ (audit.log, server.log, disabled).
+"""
+import argparse, base64, getpass, hashlib, hmac, html, http.client, json, os, re, secrets as pysecrets
+import signal, struct, subprocess, sys, tempfile, threading, time, zlib
+from collections import deque
+from http.cookies import SimpleCookie
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs
+
+HOME = os.path.expanduser("~")
+CONFIG_DIR = os.environ.get("PHONE_HUB_CONFIG_DIR", os.path.join(HOME, ".config", "phone-hub"))
+STATE_DIR = os.environ.get("PHONE_HUB_STATE_DIR", os.path.join(HOME, ".local", "state", "phone-hub"))
+CONFIG_FILE = os.path.join(CONFIG_DIR, "config.json")
+SECRETS_FILE = os.path.join(CONFIG_DIR, "secrets.json")
+AUDIT_FILE = os.path.join(STATE_DIR, "audit.log")
+DISABLED_FILE = os.path.join(STATE_DIR, "disabled")
+SERVER_LOG = os.path.join(STATE_DIR, "server.log")
+# tmux replaces tabs and other control characters with "_" for a client without a UTF-8 locale, and then workmux cannot
+# parse its output ("malformed pane information"). A process started by tmux or by a login can have no locale at all,
+# so the hub always sets one for itself and for everything it runs.
+os.environ["LANG"] = "en_US.UTF-8"
+os.environ["LC_ALL"] = "en_US.UTF-8"
+os.environ["PATH"] = ":".join(["/opt/homebrew/bin", os.path.join(HOME, ".local", "bin"), "/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin"])
+
+DEFAULTS = {
+    "login": "",                             # REQUIRED, set in ~/.config/phone-hub/config.json: the Tailscale-User-Login the hub accepts
+    "host": "",                              # REQUIRED, same file: the Host header the hub accepts (your machine's tailnet name)
+    "port": 7480,                            # loopback port
+    "capture_lines": 120, "capture_max_chars": 40000,
+    "stale_hours": 24, "list_refresh_secs": 30,
+    "session_idle_secs": 900, "session_max_secs": 43200,
+    "pin_min_len": 6, "max_failures": 5, "lockout_secs": 900, "pair_ttl_secs": 600,
+    "allowed_sources": [],                   # tailnet IPs; enforced only when the proxy forwards a client address
+    "rate_per_minute": 240,
+    # step D (annotate): where artifacts may be offered from, who annotates them, and the limits on starting sessions
+    "artifact_roots": ["~/.local/share/camunda", "~/dev/camunda/worktrees", "~/.local/share/general"],
+    "ph_annotate_path": "~/.local/bin/ph-annotate",
+    "repo_roots": ["~/dev", "~/dotfiles"],            # git working trees whose DIFF may be reviewed from the phone
+    "pin_fresh_secs": 300, "keys_per_minute": 30, "replies_per_10min": 20, "job_max_running": 3, "job_max_per_hour": 10, "job_keep_secs": 86400, "max_files": 40,
+}
+PIN_ITERS = 600_000
+MAX_BODY = 2048
+REPLY_BODY = 16000                 # a reply of 2000 characters can be ~12 KB once URL-encoded
+REPLY_MAX, KEYS_TEXT_MAX = 2000, 300
+PANE_RE = re.compile(r"^%[0-9]{1,7}$")
+URLPANE_RE = re.compile(r"^p[0-9]{1,7}$")
+
+
+# ------------------------------------------------------------------ storage
+def now():
+    return time.time()
+
+def iso(ts=None):
+    return time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime(ts or now()))
+
+def load_json(path, default):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return default
+
+def private_dir(d):
+    """Create the folder if needed and make sure only the owner can enter it (even if it already existed looser)."""
+    os.makedirs(d, mode=0o700, exist_ok=True)
+    os.chmod(d, 0o700)
+
+def write_json_atomic(path, obj, mode=0o600):
+    d = os.path.dirname(path)
+    private_dir(d)
+    fd, tmp = tempfile.mkstemp(dir=d, prefix=".tmp-")
+    try:
+        with os.fdopen(fd, "w") as f:
+            json.dump(obj, f, indent=1)
+        os.chmod(tmp, mode)
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+def cfg():
+    c = dict(DEFAULTS)
+    c.update(load_json(CONFIG_FILE, {}))
+    return c
+
+def config_problem(c):
+    """"" when the two identity settings are usable, else what is wrong. They have no default on purpose: an empty `login` would
+    match a request that has no identity header at all, so the hub must refuse to run (and to answer) until both are set."""
+    login, host = str(c.get("login") or "").strip(), str(c.get("host") or "").strip()
+    if not login or not host:
+        return "set \"login\" (your Tailscale login) and \"host\" (this machine's tailnet name) in " + CONFIG_FILE
+    if "@" not in login or "." not in host or "/" in host or " " in host or ":" in host:
+        return "\"login\" must look like you@example.com and \"host\" like machine.your-tailnet.ts.net, without a port (see " + CONFIG_FILE + ")"
+    return ""
+
+SLOCK = threading.RLock()
+
+def sload():
+    d = load_json(SECRETS_FILE, {})
+    d.setdefault("devices", {})
+    d.setdefault("fail", {"global": {"n": 0, "until": 0}, "dev": {}})
+    return d
+
+def ssave(d):
+    write_json_atomic(SECRETS_FILE, d)
+
+def audit(event, **kv):
+    try:
+        private_dir(STATE_DIR)
+        line = {"ts": iso(), "event": event}
+        for k, v in kv.items():
+            line[k] = v if isinstance(v, (int, float, bool)) or v is None else str(v)[:120]
+        fd = os.open(AUDIT_FILE, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        with os.fdopen(fd, "a") as f:
+            f.write(json.dumps(line) + "\n")
+    except OSError:
+        pass
+
+def sha(s):
+    return hashlib.sha256(s.encode()).hexdigest()
+
+
+# ------------------------------------------------------------------ text safety
+ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[()][0-9A-Za-z]|\x1b[@-Z\\-_]")
+CTRL_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f  ‪-‮⁦-⁩﻿]")
+PRIV_RE = re.compile("[-\U000f0000-\U000ffffd\U00100000-\U0010fffd]")
+
+def esc(s):
+    return html.escape(str(s), quote=True)
+
+def clean_line(s, n=200):
+    s = PRIV_RE.sub("", ANSI_RE.sub("", str(s or "")))
+    s = CTRL_RE.sub(" ", s).replace("\n", " ").replace("\r", " ").replace("\t", " ")
+    return re.sub(r"\s+", " ", s).strip()[:n]
+
+def clean_pane_text(s, cap):
+    s = ANSI_RE.sub("", s or "").replace("\r\n", "\n").replace("\r", "\n")
+    s = PRIV_RE.sub("", s)
+    s = re.sub(r"[\x00-\x08\x0b-\x1f\x7f-\x9f  ‪-‮⁦-⁩﻿]", "", s)
+    s = re.sub(r"\n{4,}", "\n\n\n", s).rstrip()
+    return s[-cap:]
+
+def fmt_age(sec):
+    sec = int(sec)
+    if sec < 90: return f"{sec}s"
+    if sec < 5400: return f"{sec // 60}m"
+    if sec < 129600: return f"{sec // 3600}h"
+    return f"{sec // 86400}d"
+
+def make_icon_png(size=180):
+    bg, bars = (15, 23, 42), [(56, 189, 248), (167, 139, 250), (52, 211, 153)]
+    rows = []
+    m, bh, gap = size // 6, size // 7, size // 12
+    for y in range(size):
+        row = bytearray([0])
+        for x in range(size):
+            c = bg
+            for i, col in enumerate(bars):
+                top = m + i * (bh + gap) + size // 8
+                w = size - 2 * m - (i * size // 8)
+                if top <= y < top + bh and m <= x < m + w:
+                    c = col
+            row += bytes(c)
+        rows.append(bytes(row))
+    raw = zlib.compress(b"".join(rows), 9)
+    def chunk(t, d):
+        return struct.pack(">I", len(d)) + t + d + struct.pack(">I", zlib.crc32(t + d) & 0xffffffff)
+    return b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", size, size, 8, 2, 0, 0, 0)) + chunk(b"IDAT", raw) + chunk(b"IEND", b"")
+
+ICON = make_icon_png()
+
+
+# ------------------------------------------------------------------ data sources (read-only)
+def run_workmux(args, timeout=8):
+    return subprocess.run(["workmux", *args], capture_output=True, text=True, timeout=timeout)
+
+def fetch_status():
+    fake = os.environ.get("PHONE_HUB_STATUS_JSON")
+    if fake:
+        return json.load(open(fake))
+    r = run_workmux(["status", "--all", "--json"])
+    if r.returncode != 0:
+        raise RuntimeError("workmux status failed")
+    return json.loads(r.stdout)
+
+def load_agents(c):
+    data = fetch_status()
+    stale = c["stale_hours"] * 3600
+    out = []
+    for a in data.get("agents") or []:
+        pane = str(a.get("pane_id") or "")
+        if not PANE_RE.match(pane):
+            continue
+        el = int(a.get("elapsed_secs") or 0)
+        st = str(a.get("status") or "")
+        state = "stale" if st == "done" and el > stale else st
+        title = re.sub(r"^[^A-Za-z0-9]+", "", clean_line(a.get("title"))).removesuffix(" - GitHub Copilot")
+        out.append({"pane": pane, "state": state, "elapsed": el, "kind": clean_line(a.get("agent_kind"), 20), "workdir": str(a.get("workdir") or ""),
+                    "session": clean_line(a.get("session"), 40), "window": clean_line(a.get("window_name"), 60), "title": title})
+    rank = {"waiting": 0, "done": 1, "working": 2, "stale": 3}
+    out.sort(key=lambda x: (rank.get(x["state"], 2), -x["elapsed"] if x["state"] == "waiting" else x["elapsed"]))
+    return out
+
+def capture_raw(pane, c, lines):
+    """The pane's text WITH its colours (SGR escapes), and the pane width. The pane id was already checked against the
+    agent list by the caller, and PANE_RE guarantees it is `%` + digits."""
+    fake = os.environ.get("PHONE_HUB_FAKE_CAPTURE_DIR")
+    if fake:
+        base = os.path.join(fake, pane.lstrip("%"))
+        raw = open(base + ".txt", errors="replace").read() if os.path.exists(base + ".txt") else ""
+        try:
+            width = int(open(base + ".width").read())
+        except (OSError, ValueError):
+            width = 131
+        return raw, width
+    if not PANE_RE.match(pane):
+        raise RuntimeError("bad pane")
+    r = subprocess.run(["tmux", "capture-pane", "-p", "-e", "-J", "-t", pane, "-S", "-" + str(int(lines))],
+                       capture_output=True, text=True, timeout=6)
+    if r.returncode != 0:
+        raise RuntimeError("capture failed")
+    w = subprocess.run(["tmux", "display-message", "-p", "-t", pane, "#{pane_width}"], capture_output=True, text=True, timeout=4)
+    try:
+        width = int(w.stdout.strip())
+    except ValueError:
+        width = 131
+    return r.stdout, width
+
+
+# ------------------------------------------------------------------ artifacts and annotation jobs (step D)
+ART_EXT = (".md", ".markdown", ".html", ".htm", ".txt")
+ART_SKIP = {"node_modules", "__pycache__", "target", "dist", "build"}
+SECRET_NAME_RE = re.compile(r"(^\.env|\.pem$|\.key$|^id_(rsa|ed25519|ecdsa)|\.p12$|\.pfx$)", re.I)
+MAX_ART_BYTES = 5 * 1024 * 1024
+MAX_FEEDBACK = 20000
+SHELLS = {"zsh", "bash", "fish", "sh", "dash", "ksh", "tcsh", "csh", "-zsh", "-bash", "-sh", "login"}
+JID_RE = re.compile(r"^[A-Za-z0-9_-]{8,40}$")
+FID_RE = re.compile(r"^[0-9a-f]{12}$")
+ANNOTATE_URL_RE = re.compile(r"^https://[A-Za-z0-9.-]+:(844[4-9]|8450)$")
+NEXT_OK = (re.compile(r"^/a/p[0-9]{1,7}(/f/[0-9a-f]{12}|/review|/keys|/reply)?$"), re.compile(r"^/job/[A-Za-z0-9_-]{8,40}$"))
+JOBS_DIR = os.path.join(STATE_DIR, "jobs")
+JOB_PROCS = {}
+
+def artifact_roots(c):
+    out = []
+    for r in c.get("artifact_roots") or []:
+        try:
+            out.append(os.path.realpath(os.path.expanduser(str(r))))
+        except Exception:
+            pass
+    return out
+
+def under(real, roots):
+    return any(real == r or real.startswith(r + os.sep) for r in roots)
+
+REVIEW_TYPES = {"uncommitted": "Uncommitted changes", "branch": "This branch vs its base", "last-commit": "Last commit"}
+
+def repo_roots(c):
+    out = []
+    for r in c.get("repo_roots") or []:
+        try:
+            out.append(os.path.realpath(os.path.expanduser(str(r))))
+        except Exception:
+            pass
+    return out
+
+def git_read(path, *args):
+    """git as a read-only tool that cannot run programs: no fsmonitor, no hooks, no pager, no prompts, no optional locks."""
+    env = dict(os.environ, GIT_TERMINAL_PROMPT="0", GIT_OPTIONAL_LOCKS="0")
+    try:
+        r = subprocess.run(["git", "-C", path, "-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null", "--no-pager", *args],
+                           capture_output=True, text=True, timeout=4, env=env)
+    except Exception:
+        return ""
+    return r.stdout.strip() if r.returncode == 0 else ""
+
+def agent_repos(a, c):
+    """Git working trees this agent works in (its folder and where the other panes of its window are), inside repo_roots."""
+    roots, cands, out, seen = repo_roots(c), [a.get("workdir")], [], set()
+    for row in pane_rows(a["pane"]):
+        if row["cmd"] != "workmux":
+            cands.append(row["path"])
+    for p in cands:
+        if not p or not os.path.isdir(p):
+            continue
+        top = git_read(p, "rev-parse", "--show-toplevel")
+        real = os.path.realpath(top) if top else ""
+        if not real or real in seen or not under(real, roots):
+            continue
+        seen.add(real)
+        out.append({"id": file_id(real), "top": real, "name": os.path.basename(real), "branch": git_read(real, "rev-parse", "--abbrev-ref", "HEAD")[:60]})
+    return out
+
+def file_id(real):
+    return hashlib.sha256(real.encode()).hexdigest()[:12]
+
+def pane_rows(pane):
+    """Every pane of the agent's window: [{pane, path, cmd}]. Read-only."""
+    fake = os.environ.get("PHONE_HUB_FAKE_PANE_PATHS")
+    if fake:
+        return (load_json(fake, {}) or {}).get(pane, [])
+    r = subprocess.run(["tmux", "list-panes", "-t", pane, "-F", "#{pane_id}\t#{pane_current_path}\t#{pane_current_command}"],
+                       capture_output=True, text=True, timeout=5)
+    rows = []
+    for ln in r.stdout.splitlines():
+        parts = ln.split("\t")
+        if len(parts) == 3:
+            rows.append({"pane": parts[0], "path": parts[1], "cmd": parts[2]})
+    return rows
+
+def pane_command(pane):
+    for row in pane_rows(pane):
+        if row["pane"] == pane:
+            return row["cmd"]
+    return ""
+
+def agent_folders(a, c):
+    """Folders that can hold this agent's artifacts: its working folder plus where the OTHER panes of its window are (the case
+    folder where the side shell opens), inside artifact_roots, and not a git checkout (that is code; diffs are a separate step)."""
+    roots = artifact_roots(c)
+    cands = [a.get("workdir")]
+    for row in pane_rows(a["pane"]):
+        if row["cmd"] != "workmux":                       # the workmux sidebar sits in some unrelated folder
+            cands.append(row["path"])
+    out = []
+    for p in cands:
+        if not p:
+            continue
+        real = os.path.realpath(p)
+        if real in out or not os.path.isdir(real) or not under(real, roots) or os.path.exists(os.path.join(real, ".git")):
+            continue
+        out.append(real)
+    return out
+
+def list_artifacts(a, c, budget=1.5):
+    roots, found, seen, t0 = artifact_roots(c), {}, 0, time.time()
+    for base in agent_folders(a, c):
+        stop = False
+        for dp, dn, fn in os.walk(base):
+            depth = dp[len(base):].count(os.sep)
+            dn[:] = [d for d in dn if d not in ART_SKIP and not d.startswith(".")] if depth < 4 else []
+            for f in fn:
+                seen += 1
+                if seen > 8000 or time.time() - t0 > budget:
+                    stop = True
+                    break
+                if not f.lower().endswith(ART_EXT) or SECRET_NAME_RE.search(f):
+                    continue
+                real = os.path.realpath(os.path.join(dp, f))
+                if real in found or not under(real, roots) or not os.path.isfile(real):
+                    continue
+                try:
+                    st = os.stat(real)
+                except OSError:
+                    continue
+                if st.st_size > MAX_ART_BYTES:
+                    continue
+                found[real] = {"id": file_id(real), "real": real, "rel": os.path.relpath(real, base), "folder": os.path.basename(base),
+                               "mtime": st.st_mtime, "size": st.st_size}
+            if stop:
+                break
+    return sorted(found.values(), key=lambda x: -x["mtime"])[:int(c["max_files"])]
+
+def pid_alive(pid):
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except (PermissionError, ValueError, TypeError):
+        return True
+
+def job_load(jid):
+    return load_json(os.path.join(JOBS_DIR, jid + ".json"), None) if JID_RE.match(jid or "") else None
+
+def job_save(j):
+    write_json_atomic(os.path.join(JOBS_DIR, j["id"] + ".json"), j)
+
+def job_view(j):
+    """State of a job, derived from FILES (stdout lines of ph-annotate, its result file) and whether it is still running, so a hub
+    restart cannot strand a job."""
+    out = ""
+    try:
+        out = open(os.path.join(JOBS_DIR, j["id"] + ".out"), errors="replace").read()
+    except OSError:
+        pass
+    url = next((ln[4:].strip() for ln in out.splitlines() if ln.startswith("URL ")), "")
+    res = load_json(os.path.join(JOBS_DIR, j["id"] + ".result.json"), {}) or {}
+    proc = JOB_PROCS.get(j["id"])
+    alive = (proc.poll() is None) if proc is not None else pid_alive(j.get("pid"))
+    decision = res.get("decision") or next((ln[9:].strip() for ln in out.splitlines() if ln.startswith("DECISION ")), "")
+    if decision:
+        state = "finished"
+    elif url and alive:
+        state = "waiting"
+    elif alive:
+        state = "starting"
+    elif url:
+        state = "ended"
+    else:
+        state = "failed"
+    return {"state": state, "url": url if ANNOTATE_URL_RE.match(url) else "", "url_bad": bool(url) and not ANNOTATE_URL_RE.match(url),
+            "decision": decision, "feedback": str(res.get("feedback") or ""), "count": int(res.get("annotationCount") or 0),
+            "reason": str(res.get("reason") or ""), "label": clean_line(res.get("label"), 80)}
+
+def running_jobs():
+    n = 0
+    try:
+        names = os.listdir(JOBS_DIR)
+    except OSError:
+        return 0
+    for nm in names:
+        if nm.endswith(".json") and not nm.endswith(".result.json"):
+            j = job_load(nm[:-5])
+            if j and job_view(j)["state"] in ("starting", "waiting"):
+                n += 1
+    return n
+
+def jobs_last_hour():
+    n = 0
+    try:
+        names = os.listdir(JOBS_DIR)
+    except OSError:
+        return 0
+    for nm in names:
+        if nm.endswith(".json") and not nm.endswith(".result.json"):
+            j = job_load(nm[:-5])
+            if j and now() - float(j.get("created", 0)) < 3600:
+                n += 1
+    return n
+
+def purge_jobs(keep):
+    try:
+        for nm in os.listdir(JOBS_DIR):
+            p = os.path.join(JOBS_DIR, nm)
+            if now() - os.path.getmtime(p) > keep:
+                os.unlink(p)
+    except OSError:
+        pass
+
+def start_job(c, devid, a, art=None, repo=None, dtype=None):
+    private_dir(JOBS_DIR)
+    purge_jobs(int(c["job_keep_secs"]))
+    jid = pysecrets.token_urlsafe(9)
+    outp, errp, resp = (os.path.join(JOBS_DIR, jid + e) for e in (".out", ".err", ".result.json"))
+    env = dict(os.environ)
+    env["PH_ANNOTATE_ROOTS"] = ":".join(artifact_roots(c))
+    env["PH_ANNOTATE_REPO_ROOTS"] = ":".join(repo_roots(c))
+    exe = os.path.expanduser(str(c["ph_annotate_path"]))
+    if repo:
+        argv = [exe, "--review", repo["top"], "--diff-type", dtype, "--result-file", resp, "--timeout-secs", "1800"]
+        target, rel, kind = repo["top"], f'{repo["name"]}: {REVIEW_TYPES[dtype]}', "review"
+    else:
+        argv = [exe, art["real"], "--result-file", resp, "--timeout-secs", "1800"]
+        target, rel, kind = art["real"], art["rel"], "annotate"
+    with open(outp, "w") as o, open(errp, "w") as e:
+        proc = subprocess.Popen(argv, stdout=o, stderr=e,
+                                stdin=subprocess.DEVNULL, start_new_session=True, env=env, close_fds=True)
+    JOB_PROCS[jid] = proc
+    threading.Thread(target=proc.wait, daemon=True).start()
+    os.chmod(outp, 0o600); os.chmod(errp, 0o600)
+    job_save({"id": jid, "dev": devid, "pane": a["pane"], "label": f'{a["session"]}:{a["window"]}', "file": target, "rel": rel, "kind": kind,
+              "diff_type": dtype or "", "created": now(), "pid": proc.pid, "sent": ""})
+    return jid
+
+def pane_guard(c, pane, mode="type"):
+    """May this pane be typed into right now? Re-run immediately before EVERY tmux call that types or presses a key.
+      mode "type": text for the input box. The SCREEN must show an empty input box (not a dialog, not working, no half-typed draft).
+      mode "enter": the moment before pressing Enter after a paste: not a dialog, not working (the box may hold our text).
+      mode "keys": a key for a dialog. The SCREEN must show a dialog.
+    Returns (ok, reason, info) where info is the screen check."""
+    info = {"state": "unknown", "draft": "", "fp": ""}
+    try:
+        a = next((x for x in load_agents(c) if x["pane"] == pane), None)
+    except Exception:
+        return False, "could not read the agent list", info
+    if not a:
+        return False, "that pane is not a registered agent pane", info
+    if pane_command(pane) in SHELLS:
+        return False, "the pane is a shell, not an agent", info
+    try:
+        raw, _w = capture_raw(pane, c, 80)
+    except Exception:
+        return False, "could not read the agent's screen", info
+    info = screen_info(raw, a["kind"])
+    st = info["state"]
+    if mode == "keys":
+        return (True, "", info) if st == "dialog" else (False, "no dialog is on the agent's screen right now", info)
+    if st == "dialog":
+        return False, "a question or permission dialog is on the agent's screen right now", info
+    # workmux `waiting` is deliberately NOT a refusal here: measured on real agents it stays `waiting` after a dialog was answered or
+    # dismissed, which would lock the phone out exactly when you want to redirect the agent. A dialog is refused because the SCREEN
+    # shows one; an unrecognised screen is refused because no empty prompt can be found.
+    if st == "working":
+        return False, "the agent is busy working right now", info
+    # workmux `working` also sticks (measured: 130+ s on an empty prompt after an Esc aborted a request; no stop hook fires). A screen
+    # that shows an empty prompt and no spinner overrides it, except in the first seconds of a turn when the spinner may not be drawn yet.
+    if a["state"] == "working" and a["elapsed"] < 15:
+        return False, "the agent started working a moment ago", info
+    if mode == "type":
+        if st == "draft":
+            return False, "there is unsent text in the agent's input box", info
+        if st != "idle":
+            return False, "the agent's screen was not recognised as an empty prompt", info
+    elif st == "unknown":
+        return False, "the agent's screen was not recognised", info
+    return True, "", info
+
+BAD_CTRL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f\u2028\u2029\u202a-\u202e\u2066-\u2069\ufeff]")
+NAV_KEYS = {"Up": "Up", "Down": "Down", "Left": "Left", "Right": "Right", "Tab": "Tab", "Space": "Space"}
+COMMIT_KEYS = {"Enter": "Enter", "Esc": "Escape", **{str(i): str(i) for i in range(1, 10)}}
+
+def check_message(text, limit, multiline=True):
+    """Validate text that will be typed into an agent. Returns (clean_text, error). Refuses rather than silently cleaning.
+    A text that starts with !, / or # is refused: those are shell, slash-command and memory shortcuts in the agents (defence in
+    depth: the screen check already makes sure the agent is at an empty prompt)."""
+    t = (text or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+    if not t:
+        return "", "Type something first."
+    if len(t) > limit:
+        return "", f"Too long: {len(t)} characters (the limit here is {limit})."
+    if BAD_CTRL_RE.search(t):
+        return "", "The text contains control characters, which are not allowed."
+    if not multiline and "\n" in t:
+        return "", "One line only here."
+    if t[0] in "!/#":
+        return "", "Text starting with !, / or # is not allowed from the phone (in the agents those are shell, slash-command and memory shortcuts)."
+    return t, ""
+
+def rate_ok(name, limit, window):
+    with STATE["lock"]:
+        dq = STATE.setdefault("w_" + name, deque())
+        t = now()
+        while dq and t - dq[0] > window:
+            dq.popleft()
+        if len(dq) >= int(limit):
+            return False
+        dq.append(t)
+        return True
+
+def tmux_type(args):
+    r = subprocess.run(["tmux", *args], capture_output=True, text=True, timeout=6)
+    return r.returncode == 0
+
+def send_feedback(c, j, view):
+    """Annotation feedback: the SAME text builder the job page shows (what you see is exactly what is typed)."""
+    return paste_and_enter(c, j["pane"], feedback_text(j, view), "ph-hub-" + j["id"])
+
+def press_key(c, pane, key, fp):
+    """One key into an open dialog. The screen must show a dialog AND still be the screen the person looked at (fingerprint)."""
+    ok, why, info = pane_guard(c, pane, "keys")
+    if not ok:
+        return False, f"Not pressed: {why}."
+    if not hmac.compare_digest(info["fp"], fp or ""):
+        return False, "Not pressed: the screen changed since you looked at it. Look again, then tap."
+    if not tmux_type(["send-keys", "-t", pane, key]):
+        return False, "Not pressed: tmux could not press the key."
+    return True, ""
+
+def paste_to_dialog(c, pane, text, fp, buf):
+    """Text into a dialog's free-text field (no Enter): same two checks as press_key."""
+    ok, why, info = pane_guard(c, pane, "keys")
+    if not ok:
+        return False, f"Not typed: {why}."
+    if not hmac.compare_digest(info["fp"], fp or ""):
+        return False, "Not typed: the screen changed since you looked at it. Look again, then try again."
+    if not (tmux_type(["set-buffer", "-b", buf, "--", text]) and tmux_type(["paste-buffer", "-p", "-d", "-b", buf, "-t", pane])):
+        return False, "Not typed: tmux could not paste the text."
+    return True, ""
+
+def paste_and_enter(c, pane, text, buf):
+    """The only code that types a message into an agent's input box. Bracketed paste, then Enter, each behind its own guard.
+    Returns (state, message)."""
+    ok, why, _info = pane_guard(c, pane, "type")
+    if not ok:
+        return "", f"Not sent: {why}."
+    if not (tmux_type(["set-buffer", "-b", buf, "--", text]) and tmux_type(["paste-buffer", "-p", "-d", "-b", buf, "-t", pane])):
+        return "", "Not sent: tmux could not paste the text."
+    ok, why, _info = pane_guard(c, pane, "enter")
+    if not ok:
+        return "pasted", f"The text was pasted but Enter was NOT pressed: {why}. Look at the agent and press Enter yourself, or clear the input."
+    time.sleep(0.4)     # Enter must arrive AFTER the paste, not with it: Copilot treats text and Enter that arrive together as one paste
+    if not tmux_type(["send-keys", "-t", pane, "Enter"]):
+        return "pasted", "The text was pasted but Enter could not be pressed. Look at the agent."
+    return "sent", "Sent."
+
+
+# ------------------------------------------------------------------ rendering a pane for a phone
+PAL16 = ["#000000", "#cd3131", "#0dbc79", "#e5e510", "#2472c8", "#bc3fbc", "#11a8cd", "#e5e5e5",
+         "#666666", "#f14c4c", "#23d18b", "#f5f543", "#3b8eea", "#d670d6", "#29b8db", "#ffffff"]
+TERM_FG, TERM_BG = "#d6deeb", "#0d1117"
+SGR_RE = re.compile(r"\x1b\[([0-9;:]*)m")
+OTHER_ESC_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-ln-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b[()][0-9A-Za-z]|\x1b[@-Z\\-_]")
+CTRL2_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f\u2028\u2029\u202a-\u202e\u2066-\u2069\ufeff]")
+# A rule is a plain horizontal line (Claude: ────, Copilot: ╻▄▄▄… and ╹▀▀▀…). Anything with corners, joints or vertical bars is a
+# box or a table, which keeps its layout in a scrolling block instead.
+RULE_CHARS = set("─━═┄┈╌┅┉╍▀▄█▁▔▂▃▅▆▇╻╹╸╺-_=~*·•")
+BOXLINE_RE = re.compile(r"[│┃┌┐└┘├┤┬┴┼╭╮╰╯]")
+PROMPT_GLYPHS = ("❯", ">", "›")
+MARK_RE = re.compile(r"^(\s*)([⏺●•▪◦·\-*+]|\d{1,3}[.)])(\s+)")
+
+def c256(n):
+    if n < 16:
+        return PAL16[n]
+    if n < 232:
+        n -= 16
+        f = lambda v: 0 if v == 0 else 55 + 40 * v
+        return "#%02x%02x%02x" % (f(n // 36), f((n // 6) % 6), f(n % 6))
+    g = 8 + 10 * (n - 232)
+    return "#%02x%02x%02x" % (g, g, g)
+
+def crgb(r, g, b):
+    cl = lambda v: max(0, min(255, int(v)))
+    return "#%02x%02x%02x" % (cl(r), cl(g), cl(b))
+
+def apply_sgr(st, params):
+    """st = [fg, bg, bold, dim, italic, underline, strike, reverse]; only validated numbers ever become CSS."""
+    p = []
+    for x in params.replace(":", ";").split(";")[:32]:
+        try:
+            p.append(int(x) if x else 0)
+        except ValueError:
+            p.append(0)
+    if not p:
+        p = [0]
+    i = 0
+    while i < len(p):
+        c = p[i]
+        if c == 0: st[:] = [None, None, False, False, False, False, False, False]
+        elif c == 1: st[2] = True
+        elif c == 2: st[3] = True
+        elif c == 3: st[4] = True
+        elif c == 4: st[5] = True
+        elif c == 7: st[7] = True
+        elif c == 9: st[6] = True
+        elif c == 22: st[2] = st[3] = False
+        elif c == 23: st[4] = False
+        elif c == 24: st[5] = False
+        elif c == 27: st[7] = False
+        elif c == 29: st[6] = False
+        elif 30 <= c <= 37: st[0] = PAL16[c - 30]
+        elif 90 <= c <= 97: st[0] = PAL16[8 + c - 90]
+        elif c == 39: st[0] = None
+        elif 40 <= c <= 47: st[1] = PAL16[c - 40]
+        elif 100 <= c <= 107: st[1] = PAL16[8 + c - 100]
+        elif c == 49: st[1] = None
+        elif c in (38, 48) and i + 1 < len(p):
+            col = None
+            if p[i + 1] == 5 and i + 2 < len(p):
+                col = c256(max(0, min(255, p[i + 2]))); i += 2
+            elif p[i + 1] == 2 and i + 4 < len(p):
+                col = crgb(p[i + 2], p[i + 3], p[i + 4]); i += 4
+            if col:
+                st[0 if c == 38 else 1] = col
+        i += 1
+
+def parse_ansi(raw):
+    """-> list of lines; a line is a list of (style_tuple, text). Style is reset at the start of every line."""
+    out = []
+    for ln in raw.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
+        st = [None, None, False, False, False, False, False, False]
+        segs, pos = [], 0
+        for m in SGR_RE.finditer(ln):
+            segs.append((tuple(st), ln[pos:m.start()]))
+            apply_sgr(st, m.group(1))
+            pos = m.end()
+        segs.append((tuple(st), ln[pos:]))
+        clean = []
+        for style, text in segs:
+            text = PRIV_RE.sub("", CTRL2_RE.sub("", OTHER_ESC_RE.sub("", text))).replace("\t", "    ")
+            if not text:
+                continue
+            if clean and clean[-1][0] == style:
+                clean[-1] = (style, clean[-1][1] + text)
+            else:
+                clean.append((style, text))
+        out.append(clean)
+    return out
+
+def seg_css(style):
+    fg, bg, bold, dim, ital, und, strike, rev = style
+    if rev:
+        fg, bg = (bg or TERM_BG), (fg or TERM_FG)
+    parts = []
+    if fg: parts.append("color:" + fg)
+    if bg: parts.append("background:" + bg)
+    if bold: parts.append("font-weight:700")
+    if dim: parts.append("opacity:.72")
+    if ital: parts.append("font-style:italic")
+    if und or strike: parts.append("text-decoration:" + " ".join(x for x, f in (("underline", und), ("line-through", strike)) if f))
+    return ";".join(parts)
+
+def segs_html(segs):
+    out = []
+    for style, text in segs:
+        css = seg_css(style)
+        out.append(f'<span style="{css}">{esc(text)}</span>' if css else esc(text))
+    return "".join(out)
+
+SCROLLBAR_CHARS = set("│┃┆┊╎╏▐▌█░▒▓▕▏")
+
+def drop_scrollbar(segs, width):
+    """Copilot (and others) draw a scrollbar in the LAST column of a full-width line. Remove that lone glyph so it is not
+    mistaken for a table or a box border."""
+    plain = "".join(t for _, t in segs)
+    if width and len(plain) >= width - 1 and len(plain) >= 3 and plain[-1] in SCROLLBAR_CHARS and plain[-2] == " ":
+        style, text = segs[-1]
+        segs = list(segs[:-1]) + ([(style, text[:-1])] if len(text) > 1 else [])
+    return segs
+
+def rstrip_segs(segs):
+    segs = list(segs)
+    while segs:
+        style, text = segs[-1]
+        t = text.rstrip()
+        if t:
+            segs[-1] = (style, t)
+            break
+        segs.pop()
+    return segs
+
+def lstrip_segs(segs):
+    segs = list(segs)
+    while segs:
+        style, text = segs[0]
+        t = text.lstrip()
+        if t:
+            segs[0] = (style, t)
+            break
+        segs.pop(0)
+    return segs
+
+def dedent_lines(blk):
+    """blk = list of segment lists. Removes the indentation all lines share (a right-aligned hint would otherwise open with a
+    screenful of nothing); the relative indentation inside the block stays."""
+    inds = [len(plain_of(l)) - len(plain_of(l).lstrip()) for l in blk if plain_of(l).strip()]
+    k = min(inds) if inds else 0
+    if k <= 0:
+        return blk
+    out = []
+    for l in blk:
+        l, cut = list(l), k
+        while l and cut > 0:
+            style, text = l[0]
+            if len(text) <= cut:
+                cut -= len(text); l.pop(0)
+            else:
+                l[0] = (style, text[cut:]); cut = 0
+        out.append(l)
+    return out
+
+def plain_of(segs):
+    return "".join(t for _, t in segs)
+
+def is_rule(plain):
+    t = plain.strip()
+    if len(t) < 8 or BOXLINE_RE.search(t):
+        return False
+    return sum(1 for ch in t if ch in RULE_CHARS or ch == " ") / len(t) >= 0.9 and sum(1 for ch in t if ch in RULE_CHARS) >= 8
+
+def bg_ratio(segs):
+    """Share of the WHOLE line (spaces included) that has a background colour. A diff bar or highlighted message colours the
+    entire row; inline code colours only the code words, so a sentence with some `code` in it stays prose."""
+    tot = sum(len(t) for _, t in segs)
+    bgd = sum(len(t) for st, t in segs if st[1] and not st[7])
+    return (bgd / tot) if tot else 0
+
+def is_pre(segs, plain, expect=None):
+    """expect = the text indent of the list item / paragraph we are inside. A line indented to match it is the CONTINUATION of
+    that item (e.g. the second line of "  1. text", indented 5 to sit under the text), not code or tool output."""
+    indent = len(plain) - len(plain.lstrip())
+    if BOXLINE_RE.search(plain) or plain.count("|") >= 2:
+        return True
+    if indent >= 5 and not MARK_RE.match(plain) and not (expect is not None and abs(indent - expect) <= 2):
+        return True                                    # deep indent = code / tool output (a nested list item or a continuation is prose)
+    if bg_ratio(segs) >= 0.85 and not plain.lstrip().startswith(PROMPT_GLYPHS):   # diff bars and code blocks keep their layout;
+        return True                                                               # a highlighted message of yours is prose
+    if re.match(r"^\s*\d{1,6}\s*[+\-]\s", plain) or re.match(r"^(@@|\+\+\+|---)\s", plain):
+        return True
+    if len(re.findall(r"\S {3,}\S", plain.replace("\xa0", ""))) >= 2:  # aligned columns (real spaces; NBSP pads inline code)
+        return True
+    return False
+
+# ------------------------------------------------------------------ what is on the screen RIGHT NOW (the guard for typing)
+# workmux's status is NOT trustworthy as a guard (measured on real agents): a question menu was open while it still said `working`
+# for ~5 s, and it kept saying `waiting` after the dialog had gone. So the SCREEN decides; the status is only a second opinion.
+DIALOG_RES = (
+    re.compile(r"(?i)\besc(?:ape)?\s+to\s+(?:cancel|exit|close|dismiss|go back)\b"),   # Claude: "Esc to cancel", Copilot: "esc to cancel"
+    re.compile(r"(?i)\benter\s+to\s+(?:select|confirm|submit|continue)\b"),             # Claude: "Enter to select"
+    re.compile(r"(?i)↑/↓\s+to\s+(?:navigate|select)"),                                    # Claude and Copilot menus
+    re.compile(r"(?i)(?:⇆|←/→)\s+select\b|\benter\s+confirm\b"),                          # OpenCode: "⇆ select  enter confirm"
+    re.compile(r"\bAllow once\b.*\bReject\b"),                                           # OpenCode permission buttons
+    re.compile(r"(?i)\bwould you like to proceed\?|\bready to code\?"),                    # Claude plan approval (measured: no "Esc to cancel" in its footer)
+    re.compile(r"(?i)\bshift\+tab\s+to\s+approve\b|\bctrl\+g\s+to\s+edit\s+in\b"),         # Claude plan approval footer
+)
+# A menu is also recognised by its shape: a numbered list with a pointer on one choice ("❯ 1. Yes"), whatever the footer says.
+MENU_LINE_RE = re.compile(r"^[\s│┃]*(?:[❯›]\s*)?\d{1,2}\.\s+\S")
+MENU_SEL_RE = re.compile(r"^[\s│┃]*[❯›]\s*\d{1,2}\.\s+\S")
+WORKING_RES = (
+    re.compile(r"…\s*\(\s*(?:\d+m\s*)?\d+s\b"),                  # Claude spinner: "✽ Smooshing… (2s · thinking ...)"
+    re.compile(r"(?i)\bctrl\+c\s+interrupt\b"),                   # Copilot: "◎ Working ctrl+c interrupt"
+    re.compile(r"(?i)\besc\s+(?:to\s+)?interrupt\b"),             # OpenCode: "esc interrupt"; older Claude: "esc to interrupt"
+)
+LABELLED_RULE_RE = re.compile(r"^\s*[─━]{20,}\s")
+OC_MODEL_RE = re.compile(r"^\s*┃\s+[A-Z][A-Za-z]+\s·\s")
+GAP_RE = re.compile(r"\s{4,}")
+
+def screen_lines(raw, n=40):
+    """The last n non-empty lines of a capture as (plain, nodim): plain text (ANSI removed, trailing spaces removed) and the same
+    line without its DIM text. Claude shows a dim suggestion of the next reply in the empty prompt: that is not a draft."""
+    segs = [rstrip_segs(l) for l in parse_ansi(raw)]
+    segs = [l for l in segs if plain_of(l).strip()][-n:]
+    return [plain_of(l) for l in segs], ["".join(t for st, t in l if not st[3]) for l in segs]
+
+def prompt_text(lines, kind, nodim=None):
+    """The text currently in the agent's input box, "" if empty, or None if the box cannot be found (unknown screen).
+    Dim text (ghost suggestions, placeholders) does not count as text."""
+    nodim = nodim or lines
+    if kind == "claude":
+        # The TOP rule of the prompt area carries the session name once a session is renamed ("──────── name | …"), so it is
+        # not a pure rule: accept a line that STARTS with a long run of rule characters. The bottom rule is always pure.
+        rules = [i for i, l in enumerate(lines) if is_rule(l) or LABELLED_RULE_RE.match(l)]
+        if len(rules) < 2:
+            return None
+        a, b = rules[-2], rules[-1]
+        for i in range(a + 1, b):
+            if lines[i].strip().startswith("❯"):
+                t = nodim[i].strip().lstrip("❯").strip()
+                return "" if t.startswith('Try "') else t
+        return None
+    if kind == "copilot":
+        rules = [i for i, l in enumerate(lines) if is_rule(l)]
+        if len(rules) < 2:
+            return None
+        parts = [nodim[i].strip()[1:].strip() for i in range(rules[-2] + 1, rules[-1]) if lines[i].strip().startswith("┃")]
+        return " ".join(p for p in parts if p)
+    if kind == "opencode":
+        m = max((i for i, l in enumerate(lines) if OC_MODEL_RE.match(l)), default=None)
+        if m is None:
+            return None
+        parts, j = [], m - 1
+        while j >= 0 and lines[j].lstrip().startswith("┃"):
+            chunk = GAP_RE.split(nodim[j].lstrip()[1:].strip())[0].strip()      # the right-hand sidebar sits after a wide gap
+            if chunk and not chunk.startswith("Ask anything"):
+                parts.append(chunk)
+            j -= 1
+        return " ".join(reversed(parts))
+    return None
+
+def screen_info(raw, kind):
+    """-> {"state": dialog|working|idle|draft|unknown, "draft": text, "fp": fingerprint}. `unknown` means: do not type anything."""
+    lines, nodim = screen_lines(raw)
+    tail = lines[-30:]
+    # The fingerprint includes each piece's COLOUR STYLE: OpenCode shows which button is selected only by colour, and a moved
+    # highlight must change it. Digits in the text are masked (timers, counters) so a ticking clock does not.
+    styled = [l for l in (rstrip_segs(x) for x in parse_ansi(raw)) if plain_of(l).strip()][-25:]
+    fp = hashlib.sha256("\n".join("".join(f"{st!r}\x00{re.sub(r'[0-9]+', '#', t)}\x01" for st, t in l) for l in styled).encode()).hexdigest()[:16]
+    if any(rx.search(l) for l in tail[-14:] for rx in DIALOG_RES) or (
+            any(MENU_SEL_RE.match(l) for l in tail[-14:]) and sum(1 for l in tail[-14:] if MENU_LINE_RE.match(l)) >= 2):
+        return {"state": "dialog", "draft": "", "fp": fp}
+    if any(rx.search(l) for l in tail[-14:] for rx in WORKING_RES):
+        return {"state": "working", "draft": "", "fp": fp}
+    t = prompt_text(lines, kind, nodim)
+    if t is None:
+        return {"state": "unknown", "draft": "", "fp": fp}
+    return {"state": "draft" if t else "idle", "draft": t[:300], "fp": fp}
+
+def render_pane(raw, width, mode, max_lines, max_chars):
+    """Return HTML for the pane card. mode 'smart': prose reflowed and wrapped, layout-sensitive text in sideways-scrolling
+    blocks, rules as thin lines, prompt area and status styled. mode 'exact': one scrolling block, no guessing."""
+    lines = parse_ansi(raw[-(max_chars * 3):])
+    lines = [rstrip_segs(drop_scrollbar(l, int(width))) for l in lines]
+    while lines and not plain_of(lines[-1]).strip():
+        lines.pop()
+    lines = lines[-max_lines:]
+    total = 0
+    keep = []
+    for l in reversed(lines):                           # character cap measured on text, keeping the END
+        total += len(plain_of(l)) + 1
+        if total > max_chars:
+            break
+        keep.append(l)
+    lines = list(reversed(keep))
+    if not lines:
+        return ""
+    if mode == "exact":
+        return '<div class="term"><pre class="blk">' + "\n".join(segs_html(l) for l in lines) + '</pre></div>'
+
+    plains = [plain_of(l) for l in lines]
+    rules = [i for i, p in enumerate(plains) if is_rule(p)]
+    tail = [i for i in rules if i >= len(lines) - 14]
+    prompt = status = None
+    if len(tail) >= 2:
+        a, b = tail[-2], tail[-1]
+        prompt, status, body_end = (a + 1, b), b + 1, a
+    elif len(tail) == 1:
+        prompt, status, body_end = None, tail[-1] + 1, tail[-1]
+    else:
+        body_end = len(lines)
+    W = max(40, int(width))
+    html_parts = []
+
+    def block(idx_from, idx_to):
+        out, i, gap = [], idx_from, False
+        while i < idx_to:
+            segs, plain = lines[i], plains[i]
+            if not plain.strip():
+                gap = True
+                i += 1
+                continue
+            if gap and out:
+                out.append('<div class="gap"></div>')
+            gap = False
+            if is_rule(plain):
+                out.append("<hr>")
+                i += 1
+                continue
+            if is_pre(segs, plain):
+                j, grp = i, []
+                while j < idx_to and plains[j].strip() and not is_rule(plains[j]) and is_pre(lines[j], plains[j]):
+                    grp.append(lines[j]); j += 1
+                out.append('<pre class="blk">' + "\n".join(segs_html(g) for g in dedent_lines(grp)) + '</pre>')
+                i = j
+                continue
+            # prose run: join hard-wrapped lines back into paragraphs
+            cur, cur_plain, last_full = segs, plain, len(plain) >= 0.8 * W
+            m = MARK_RE.match(plain)
+            text_indent = len(m.group(0)) if m else len(plain) - len(plain.lstrip())
+            j = i + 1
+            while j < idx_to and plains[j].strip() and not is_rule(plains[j]) and not is_pre(lines[j], plains[j], text_indent):
+                nxt, nplain = lines[j], plains[j]
+                nind = len(nplain) - len(nplain.lstrip())
+                if last_full and not MARK_RE.match(nplain) and abs(nind - text_indent) <= 2 and not nplain.lstrip().startswith(("#", ">")):
+                    cur = cur + [((None, None, False, False, False, False, False, False), " ")] + lstrip_segs(nxt)
+                    cur_plain = cur_plain + " " + nplain.lstrip()
+                    last_full = len(nplain) >= 0.8 * W
+                    j += 1
+                else:
+                    break
+            cls = "l"
+            band = ""
+            if bg_ratio(cur) >= 0.85:
+                bgc = next((st[1] for st, tx in cur if st[1] and not st[7]), None)
+                if bgc:
+                    cls += " bgl"; band = f' style="background:{bgc}"'
+            if MARK_RE.match(cur_plain): cls += " li"
+            if cur_plain.lstrip().startswith(">"): cls += " q"
+            if re.match(r"^\s*#{1,4}\s", cur_plain): cls += " h"
+            out.append(f'<div class="{cls}"{band}>{segs_html(cur)}</div>')
+            i = j
+        return "".join(out)
+
+    html_parts.append(block(0, body_end))
+    if prompt:
+        a, b = prompt
+        html_parts.append('<hr><div class="prompt"><div class="lab">prompt area</div>'
+                          + "".join(f'<div class="l">{segs_html(lines[i])}</div>' for i in range(a, b) if plains[i].strip() and plains[i].strip() not in SCROLLBAR_CHARS) + '</div><hr>')
+    elif len(tail) == 1:
+        html_parts.append("<hr>")
+    if status is not None and status < len(lines):
+        html_parts.append('<div class="status">' + "".join(f'<div>{segs_html(lines[i])}</div>' for i in range(status, len(lines)) if plains[i].strip()) + '</div>')
+    return '<div class="term">' + "".join(html_parts) + '</div>'
+
+
+# ------------------------------------------------------------------ pages
+CSS = """
+:root{color-scheme:light dark;--bg:#f6f7f9;--fg:#111827;--mut:#6b7280;--card:#fff;--bd:#e5e7eb;--acc:#2563eb;--wait:#b45309;--done:#047857;--work:#1d4ed8;--stale:#6b7280}
+@media (prefers-color-scheme:dark){:root{--bg:#0b1020;--fg:#e5e7eb;--mut:#94a3b8;--card:#131a2e;--bd:#25304d;--acc:#60a5fa;--wait:#fbbf24;--done:#34d399;--work:#60a5fa;--stale:#94a3b8}}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:16px/1.4 -apple-system,system-ui,sans-serif;padding:max(12px,env(safe-area-inset-top)) 14px 40px}
+h1{font-size:20px;margin:6px 0 12px}a{color:var(--acc)}main{max-width:720px;margin:0 auto}
+.row{display:block;background:var(--card);border:1px solid var(--bd);border-radius:12px;padding:12px;margin:8px 0;color:inherit;text-decoration:none}
+.top{display:flex;gap:8px;align-items:baseline;flex-wrap:wrap}.tag{font-weight:700;font-size:13px;letter-spacing:.04em}
+.waiting{color:var(--wait)}.done{color:var(--done)}.working{color:var(--work)}.stale{color:var(--stale)}
+.where{font-weight:600;word-break:break-word}.title{color:var(--mut);font-size:14px;margin-top:2px;word-break:break-word}
+pre{background:var(--card);border:1px solid var(--bd);border-radius:12px;padding:10px;font:12px/1.35 ui-monospace,Menlo,monospace;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere}
+.btn,button{display:inline-block;background:var(--acc);color:#fff;border:0;border-radius:10px;padding:12px 16px;font-size:16px;text-decoration:none;margin:6px 6px 6px 0}
+input[type=password],input[type=text],input[type=number]{width:100%;font-size:18px;padding:12px;border-radius:10px;border:1px solid var(--bd);background:var(--card);color:var(--fg);margin:6px 0}
+.mut{color:var(--mut);font-size:14px}.err{color:#dc2626}details{margin:10px 0}summary{padding:8px 0;color:var(--mut)}
+.term{background:#0d1117;color:#d6deeb;border:1px solid #25304d;border-radius:12px;padding:10px 12px;overflow:hidden}
+.term .l{font:15px/1.45 -apple-system,system-ui,sans-serif;margin:3px 0;overflow-wrap:anywhere}
+.term .li{padding-left:1.3em;text-indent:-1.3em}.term .bgl{padding:4px 8px;border-radius:8px}.term .gap{height:8px}
+.term .q{border-left:3px solid #60a5fa;padding-left:8px;color:#a5b4fc}.term .h{font-weight:700;color:#e2e8f0}
+.term pre.blk{margin:6px 0;padding:6px 8px;background:#111827;border:1px solid #1f2937;border-radius:8px;white-space:pre;overflow-x:auto;-webkit-overflow-scrolling:touch;font:12px/1.35 ui-monospace,Menlo,monospace;color:#d6deeb}
+.term hr{border:0;border-top:1px solid #334155;margin:10px 0}
+.term .prompt{border:1px dashed #475569;border-radius:8px;padding:6px 8px;margin:4px 0;position:relative}
+.term .prompt .lab{font:11px/1 -apple-system,system-ui,sans-serif;color:#64748b;text-transform:uppercase;letter-spacing:.06em;margin-bottom:4px}
+.term .status{font:12px/1.4 ui-monospace,Menlo,monospace;color:#94a3b8;margin-top:4px;overflow-wrap:anywhere}
+.tools a{margin-right:14px}
+textarea{width:100%;min-height:140px;font:17px/1.4 -apple-system,system-ui,sans-serif;padding:12px;border-radius:10px;border:1px solid var(--bd);background:var(--card);color:var(--fg);margin:6px 0}
+.pad{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin:8px 0}.pad form{margin:0}
+.pad button,.pad a.btn{width:100%;margin:0;padding:16px 6px;font-size:18px;text-align:center}
+.pad .nav{background:#475569}.pad .go{background:#b45309}.pad .no{background:#b91c1c}
+.stop{border:2px solid #b45309;border-radius:12px;padding:10px 12px;margin:10px 0}
+"""
+
+def page(title, body, refresh=0, status=200):
+    meta = f'<meta http-equiv="refresh" content="{int(refresh)}">' if refresh else ""
+    doc = (f'<!doctype html><html lang="en"><head><meta charset="utf-8">'
+           f'<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">'
+           f'<meta name="apple-mobile-web-app-capable" content="yes"><meta name="mobile-web-app-capable" content="yes">'
+           f'<meta name="apple-mobile-web-app-title" content="Agents"><meta name="apple-mobile-web-app-status-bar-style" content="default">'
+           f'<link rel="apple-touch-icon" href="/icon.png"><meta name="theme-color" content="#0f172a">{meta}'
+           f'<title>{esc(title)}</title><style>{CSS}</style></head><body><main>{body}</main></body></html>')
+    return status, doc.encode("utf-8"), "text/html; charset=utf-8"
+
+TAGS = {"waiting": "WAIT", "done": "DONE", "working": "WORK", "stale": "STALE"}
+KINDS = {"claude": "cl", "copilot": "co", "opencode": "oc"}
+
+def row_html(a):
+    tag = TAGS.get(a["state"], "?")
+    return (f'<a class="row" href="/a/p{esc(a["pane"].lstrip("%"))}#end"><div class="top"><span class="tag {esc(a["state"])}">{esc(tag)}</span>'
+            f'<span class="mut">{esc(fmt_age(a["elapsed"]))}</span><span class="mut">{esc(KINDS.get(a["kind"], a["kind"][:2]))}</span>'
+            f'<span class="where">{esc(a["session"])}:{esc(a["window"])}</span></div><div class="title">{esc(a["title"])}</div></a>')
+
+def render_list(agents, c, auto):
+    live = [a for a in agents if a["state"] != "stale"]
+    old = [a for a in agents if a["state"] == "stale"]
+    body = '<h1>Agents</h1>'
+    body += "".join(row_html(a) for a in live) or '<p class="mut">No agents need a look.</p>'
+    if old:
+        body += f'<details><summary>{len(old)} older (done for over {int(c["stale_hours"])}h)</summary>' + "".join(row_html(a) for a in old) + '</details>'
+    toggle = '<a href="/?r=0">Pause auto-refresh</a>' if auto else '<a href="/">Resume auto-refresh</a>'
+    body += f'<p class="mut"><a href="/">Refresh</a> &middot; {toggle}</p>'
+    body += '<form method="post" action="/logout"><input type="hidden" name="t" value="__CSRF__"><button type="submit">Lock</button></form>'
+    return body
+
+
+# ------------------------------------------------------------------ server state
+STATE = {"sessions": {}, "hits": deque(), "lock": threading.Lock()}
+
+def cookie_header(name, value, max_age):
+    return f"{name}={value}; Path=/; Max-Age={int(max_age)}; Secure; HttpOnly; SameSite=Lax"
+
+def words_code():
+    try:
+        words = [w.strip() for w in open("/usr/share/dict/words", errors="ignore")]
+        words = sorted({w for w in words if re.fullmatch(r"[a-z]{4,7}", w)})
+        if len(words) > 5000:
+            return "-".join(pysecrets.choice(words) for _ in range(3))
+    except OSError:
+        pass
+    return "-".join(pysecrets.token_hex(2) for _ in range(3))
+
+def hash_pin(pin, salt, iters=PIN_ITERS):
+    return hashlib.pbkdf2_hmac("sha256", pin.encode(), salt, iters)
+
+
+class Handler(BaseHTTPRequestHandler):  # Pages (step D) is mixed in below
+    server_version = "phone-hub"
+    sys_version = ""
+    timeout = 10
+
+    def log_message(self, *a):
+        pass
+
+    # ---- response helpers
+    def respond(self, status, body, ctype="text/plain; charset=utf-8", headers=()):
+        self.send_response(status)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("Content-Security-Policy", "default-src 'none'; style-src 'unsafe-inline'; img-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'")
+        for k, v in headers:
+            self.send_header(k, v)
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.wfile.write(body)
+        self.close_connection = True
+
+    def deny(self, status=403, text="Not allowed."):
+        self.respond(status, text.encode())
+
+    def redirect(self, where, headers=()):
+        self.respond(303, b"", headers=[("Location", where), *headers])
+
+    def send_page(self, tup, headers=()):
+        status, body, ctype = tup
+        self.respond(status, body, ctype, headers)
+
+    # ---- request plumbing
+    def do_GET(self):
+        self.route("GET")
+
+    def do_POST(self):
+        self.route("POST")
+
+    def _other(self):
+        self.deny(405, "Method not allowed.")
+    do_PUT = do_DELETE = do_PATCH = do_OPTIONS = do_HEAD = _other
+
+    def form(self, limit=None):
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            n = -1
+        if n < 0 or n > (limit or MAX_BODY):
+            return None
+        if "application/x-www-form-urlencoded" not in (self.headers.get("Content-Type") or ""):
+            return None
+        raw = self.rfile.read(n).decode("utf-8", "replace")
+        return {k: v[0] for k, v in parse_qs(raw, keep_blank_values=True).items()}
+
+    def cookies(self):
+        c = SimpleCookie()
+        try:
+            c.load(self.headers.get("Cookie") or "")
+        except Exception:
+            return {}
+        return {k: m.value for k, m in c.items()}
+
+    def device(self):
+        tok = self.cookies().get("ph_dev")
+        if not tok or len(tok) > 200:
+            return None
+        h = sha(tok)
+        with SLOCK:
+            d = sload()
+            rec = d["devices"].get(h)
+            if not rec:
+                return None
+            if now() - rec.get("last_seen", 0) > 60:
+                rec["last_seen"] = now()
+                ssave(d)
+        return h[:8], rec
+
+    def session(self, devid):
+        tok = self.cookies().get("ph_sess")
+        if not tok or len(tok) > 200:
+            return None
+        c = cfg()
+        with STATE["lock"]:
+            s = STATE["sessions"].get(sha(tok))
+            if not s:
+                return None
+            t = now()
+            if s["dev"] != devid or t - s["last"] > c["session_idle_secs"] or t - s["created"] > c["session_max_secs"]:
+                STATE["sessions"].pop(sha(tok), None)
+                return None
+            s["last"] = t
+            return s
+
+    def xff_chain(self):
+        return clean_line(self.headers.get("X-Forwarded-For") or "", 200)
+
+    def client_ip(self):
+        # the RIGHTMOST entry is the one our own proxy appended; anything to its left was sent by the client
+        parts = [p.strip() for p in (self.headers.get("X-Forwarded-For") or "").split(",") if p.strip()]
+        return parts[-1][:64] if parts else ""
+
+    # ---- the one place every request goes through
+    def route(self, method):
+        c = cfg()
+        path, _, query = self.path.partition("?")
+        if len(self.path) > 300:
+            return self.deny(414, "Not allowed.")
+        if path == "/healthz":
+            return self.respond(200, b"ok")
+        if os.path.exists(DISABLED_FILE):
+            return self.deny(503, "Switched off.")
+        with STATE["lock"]:
+            t = now()
+            while STATE["hits"] and t - STATE["hits"][0] > 60:
+                STATE["hits"].popleft()
+            if len(STATE["hits"]) >= int(c["rate_per_minute"]):
+                return self.deny(429, "Slow down.")
+            STATE["hits"].append(t)
+
+        if config_problem(c):
+            audit("deny_unconfigured")
+            return self.deny(503, "Not configured.")
+        raw_host = self.headers.get("Host") or ""
+        host = raw_host.split(":")[0].strip().lower()
+        login = self.headers.get("Tailscale-User-Login") or ""
+        if path == "/whoami":
+            return self.whoami(c, login, raw_host)
+        seen = dict(host=clean_line(raw_host, 80), xfh=clean_line(self.headers.get("X-Forwarded-Host") or "", 80),
+                    has_identity=bool(login), xff=self.xff_chain())
+        if host != c["host"].lower():
+            audit("deny_host", **seen)
+            return self.deny()
+        if not hmac.compare_digest(login.encode(), c["login"].encode()):
+            audit("deny_identity", **seen)
+            return self.deny()
+        if c.get("allowed_sources") and self.client_ip() and self.client_ip() not in c["allowed_sources"]:
+            audit("deny_source", ip=self.client_ip())
+            return self.deny()
+        if path == "/icon.png" and method == "GET":
+            return self.respond(200, ICON, "image/png", [("Cache-Control", "max-age=86400")])
+
+        dev = self.device()
+        if path == "/pair":
+            return self.pair(c, method, dev)
+        if not dev:
+            if method == "GET":
+                return self.redirect("/pair")
+            return self.deny()
+        devid, devrec = dev
+        if path == "/login":
+            return self.login(c, method, devid, devrec)
+        sess = self.session(devid)
+        if not sess:
+            return self.redirect("/login") if method == "GET" else self.deny()
+
+        if path == "/" and method == "GET":
+            return self.index(c, sess, devrec, query)
+        if path.startswith("/a/"):
+            return self.agent_routes(c, sess, devrec, devid, method, path, query)
+        if path.startswith("/job/"):
+            return self.job_routes(c, sess, devrec, devid, method, path)
+        if path == "/reauth":
+            return self.reauth(c, method, sess, devid, devrec, query)
+        if path == "/logout" and method == "POST":
+            f = self.form() or {}
+            if not hmac.compare_digest(f.get("t", ""), sess["csrf"]):
+                return self.deny()
+            tok = self.cookies().get("ph_sess", "")
+            with STATE["lock"]:
+                STATE["sessions"].pop(sha(tok), None)
+            audit("logout", dev=devrec.get("label"))
+            return self.redirect("/login", [("Set-Cookie", cookie_header("ph_sess", "", 0))])
+        return self.deny(404, "Not found.")
+
+    # ---- pages
+    def whoami(self, c, login, raw_host):
+        """Diagnostics only: shows what the proxy delivered. Shows no secret and is allowed even when the Host is wrong
+        (so a rewritten Host header can be seen instead of a blank refusal)."""
+        names = sorted(k for k in self.headers.keys() if k.lower().startswith(("tailscale", "x-forwarded", "x-real")))
+        ok = bool(login) and hmac.compare_digest(login.encode(), c["login"].encode())
+        host_ok = raw_host.split(":")[0].strip().lower() == c["host"].lower()
+        body = ('<h1>Connection check</h1>'
+                f'<p>Host header received: <b>{esc(clean_line(raw_host, 80))}</b> ({"correct" if host_ok else "NOT what the hub expects"})</p>'
+                f'<p>Identity header: <b>{"present, matches" if ok else ("present, does not match" if login else "MISSING")}</b></p>'
+                f'<p>X-Forwarded-For (whole chain): <b>{esc(self.xff_chain() or "not sent")}</b></p>'
+                f'<p>Client address the hub would use: <b>{esc(self.client_ip() or "not forwarded")}</b></p>'
+                f'<p class="mut">Proxy headers seen: {esc(", ".join(names) or "none")}</p>')
+        audit("whoami", host_ok=host_ok, identity=("match" if ok else ("other" if login else "missing")), xff=self.xff_chain())
+        self.send_page(page("Connection check", body))
+
+    def pair(self, c, method, dev):
+        with SLOCK:
+            d = sload()
+            p = d.get("pair") or {}
+        active = bool(p) and now() < p.get("expires", 0) and not p.get("used")
+        locked = max(0, d.get("pair_locked_until", 0) - now())
+        if method == "GET":
+            if dev:
+                return self.redirect("/")
+            hint = ('<p class="mut">Tip: pair inside the app you will use every day. Add this page to your Home Screen first '
+                    '(Share, Add to Home Screen), open it from the icon, then enter the code there. The Home Screen app and '
+                    'Safari do not share their sign-in.</p>')
+            if locked > 0:
+                body = f'<h1>Pair this phone</h1><p class="err">Too many tries. Try again in {int(locked // 60) + 1} minutes.</p>{hint}'
+            elif not active:
+                body = ('<h1>Pair this phone</h1><p>No pairing is in progress.</p><p class="mut">On the Mac, in a terminal, run '
+                        '<b>phone-hub pair</b> and enter the code it shows.</p>' + hint)
+            else:
+                body = ('<h1>Pair this phone</h1><form method="post" action="/pair">'
+                        '<label>Code from the Mac</label><input type="text" name="code" autocapitalize="none" autocorrect="off" autocomplete="off">'
+                        '<label>Name for this phone</label><input type="text" name="label" value="iPhone" maxlength="40">'
+                        '<button type="submit">Pair</button></form>' + hint)
+            return self.send_page(page("Pair", body))
+        f = self.form()
+        if f is None:
+            return self.deny(400, "Bad request.")
+        if locked > 0 or not active:
+            audit("pair_refused")
+            return self.deny()
+        ok = hmac.compare_digest(sha((f.get("code") or "").strip().lower()), p.get("hash", ""))
+        with SLOCK:
+            d = sload()
+            p = d.get("pair") or {}
+            if not ok:
+                p["fails"] = p.get("fails", 0) + 1
+                audit("pair_fail", n=p["fails"])
+                if p["fails"] >= int(c["max_failures"]):
+                    d.pop("pair", None)
+                    d["pair_locked_until"] = now() + int(c["lockout_secs"])
+                    audit("pair_locked")
+                else:
+                    d["pair"] = p
+                ssave(d)
+                return self.deny()
+            token = pysecrets.token_urlsafe(32)
+            label = re.sub(r"[^\w .\-]", "", f.get("label") or "")[:40].strip() or "device"
+            d["devices"][sha(token)] = {"label": label, "created": now(), "last_seen": now()}
+            d.pop("pair", None)
+            ssave(d)
+        audit("pair_ok", dev=label)
+        return self.redirect("/login", [("Set-Cookie", cookie_header("ph_dev", token, 31536000))])
+
+    def login(self, c, method, devid, devrec):
+        with SLOCK:
+            d = sload()
+        pin = d.get("pin")
+        if method == "GET":
+            if self.session(devid):
+                return self.redirect("/")
+            if not pin:
+                body = '<h1>PIN not set</h1><p class="mut">On the Mac, in a terminal, run <b>phone-hub set-pin</b>.</p>'
+            else:
+                body = ('<h1>Unlock</h1><form method="post" action="/login"><label>PIN</label>'
+                        '<input type="password" name="pin" inputmode="numeric" pattern="[0-9]*" autocomplete="off" autofocus>'
+                        '<button type="submit">Unlock</button></form>')
+            return self.send_page(page("Unlock", body))
+        if method != "POST" or not pin:
+            return self.deny()
+        f = self.form()
+        if f is None:
+            return self.deny(400, "Bad request.")
+        res, until = self.verify_pin(c, devid, devrec, f.get("pin", ""), "login")
+        if res == "locked":
+            return self.send_page(page("Locked", f'<h1>Locked</h1><p class="err">Too many wrong PINs. Try again in {int((until - now()) // 60) + 1} minutes.</p>', status=429))
+        if res == "bad":
+            return self.send_page(page("Unlock", '<h1>Unlock</h1><p class="err">Wrong PIN.</p><form method="post" action="/login"><label>PIN</label><input type="password" name="pin" inputmode="numeric" pattern="[0-9]*" autocomplete="off" autofocus><button type="submit">Unlock</button></form>', status=403))
+        sid = pysecrets.token_urlsafe(32)
+        with STATE["lock"]:
+            STATE["sessions"][sha(sid)] = {"dev": devid, "created": now(), "last": now(), "pin_at": now(), "csrf": pysecrets.token_urlsafe(16)}
+        audit("login_ok", dev=devrec.get("label"))
+        return self.redirect("/", [("Set-Cookie", cookie_header("ph_sess", sid, int(c["session_max_secs"])))])
+
+    def verify_pin(self, c, devid, devrec, pin_text, event):
+        """-> ("ok"|"bad"|"locked", locked_until). Shared by login and re-entering the PIN before a write; same lockout counters."""
+        with SLOCK:
+            d = sload()
+            pin = d.get("pin")
+            until = max(d["fail"]["global"].get("until", 0), d["fail"]["dev"].get(devid, {}).get("until", 0))
+            if not pin:
+                return "bad", 0
+            if until > now():
+                audit(event + "_locked", dev=devrec.get("label"))
+                return "locked", until
+            salt = base64.b64decode(pin["salt"])
+            good = hmac.compare_digest(hash_pin(pin_text, salt, int(pin["iters"])), base64.b64decode(pin["hash"]))
+            recs = [d["fail"]["global"], d["fail"]["dev"].setdefault(devid, {"n": 0, "until": 0})]
+            if not good:
+                for r in recs:
+                    r["n"] = r.get("n", 0) + 1
+                    if r["n"] >= int(c["max_failures"]):
+                        r["until"] = now() + int(c["lockout_secs"]); r["n"] = 0
+                ssave(d)
+                audit(event + "_fail", dev=devrec.get("label"))
+                return "bad", 0
+            for r in recs:
+                r["n"] = 0
+            ssave(d)
+            return "ok", 0
+
+    def pin_fresh(self, c, sess):
+        return now() - sess.get("pin_at", 0) <= int(c["pin_fresh_secs"])
+
+    def csrf_ok(self, sess, f):
+        return f is not None and hmac.compare_digest(f.get("t", ""), sess["csrf"])
+
+    @staticmethod
+    def safe_next(n):
+        return n if any(rx.match(n or "") for rx in NEXT_OK) else "/"
+
+    def reauth(self, c, method, sess, devid, devrec, query):
+        if method == "GET":
+            nxt = self.safe_next((parse_qs(query).get("next") or [""])[0])
+            body = ('<h1>PIN again</h1><p class="mut">Sending or starting something needs your PIN within the last few minutes.</p>'
+                    f'<form method="post" action="/reauth"><input type="hidden" name="t" value="{esc(sess["csrf"])}"><input type="hidden" name="next" value="{esc(nxt)}">'
+                    '<label>PIN</label><input type="password" name="pin" inputmode="numeric" pattern="[0-9]*" autocomplete="off" autofocus>'
+                    '<button type="submit">Continue</button></form>')
+            return self.send_page(page("PIN", body))
+        f = self.form()
+        if not self.csrf_ok(sess, f):
+            return self.deny()
+        nxt = self.safe_next(f.get("next", ""))
+        res, until = self.verify_pin(c, devid, devrec, f.get("pin", ""), "reauth")
+        if res == "locked":
+            return self.send_page(page("Locked", f'<h1>Locked</h1><p class="err">Too many wrong PINs. Try again in {int((until - now()) // 60) + 1} minutes.</p>', status=429))
+        if res == "bad":
+            return self.send_page(page("PIN", '<h1>PIN again</h1><p class="err">Wrong PIN.</p><p><a href="' + esc(nxt) + '">Back</a></p>', status=403))
+        with STATE["lock"]:
+            sess["pin_at"] = now()
+        audit("reauth_ok", dev=devrec.get("label"))
+        return self.redirect(nxt)
+
+    def index(self, c, sess, devrec, query):
+        auto = "r=0" not in query
+        try:
+            agents = load_agents(c)
+            body = render_list(agents, c, auto)
+        except Exception:
+            audit("agents_read_failed")
+            body = '<h1>Agents</h1><p class="err">Could not read the agent list.</p><p><a href="/">Try again</a></p>'
+        body = body.replace("__CSRF__", esc(sess["csrf"]))
+        self.send_page(page("Agents", body, refresh=int(c["list_refresh_secs"]) if auto else 0))
+
+    def agent(self, c, sess, devrec, seg, query=""):
+        if not URLPANE_RE.match(seg):
+            return self.deny(404, "Not found.")
+        pane = "%" + seg[1:]
+        try:
+            agents = load_agents(c)
+        except Exception:
+            audit("agents_read_failed")
+            return self.deny(404, "Not found.")
+        a = next((x for x in agents if x["pane"] == pane), None)
+        if not a:
+            return self.deny(404, "Not found.")
+        q = parse_qs(query)
+        mode = "exact" if q.get("v", [""])[0] == "exact" else "smart"
+        try:
+            n = int(q.get("n", [""])[0])
+        except ValueError:
+            n = int(c["capture_lines"])
+        n = n if n in (60, 120, 250, 500) else int(c["capture_lines"])
+        try:
+            raw, width = capture_raw(pane, c, n + 80)
+            card = render_pane(raw, width, mode, n, int(c["capture_max_chars"]))
+            shown = card or '<p class="mut">Nothing to show yet.</p>'
+        except Exception:
+            shown = '<p class="err">Could not read this agent&rsquo;s screen.</p>'
+        base = f"/a/p{seg[1:]}"
+        other = "smart" if mode == "exact" else "exact"
+        tools = (f'<p class="tools"><a href="{base}?v={mode}&amp;n={n}#end">Refresh</a>'
+                 f'<a href="{base}?v={other}&amp;n={n}#end">{"Reading view" if other == "smart" else "Exact view (scroll sideways)"}</a>'
+                 + "".join(f'<a href="{base}?v={mode}&amp;n={k}#end">{k} lines</a>' for k in (60, 120, 250, 500) if k != n) + '</p>')
+        audit("view_agent", dev=devrec.get("label"), pane=pane, mode=mode, lines=n)
+        try:
+            sstate = screen_info(raw, a["kind"])["state"]
+        except Exception:
+            sstate = "unknown"
+        ans = f'<a class="btn" style="background:#b45309" href="{base}/keys">Answer the question</a> '
+        rep_ = f'<a class="btn" href="{base}/reply">Reply</a> '
+        # the screen decides; workmux `waiting` on a screen that is not recognised as a dialog offers both
+        act = ans if sstate == "dialog" else (rep_ + (ans if a["state"] == "waiting" and sstate != "idle" else ""))
+        tag = TAGS.get(a["state"], "?")
+        body = (f'<p><a href="/">&larr; Agents</a></p><div class="top"><span class="tag {esc(a["state"])}">{esc(tag)}</span>'
+                f'<span class="mut">{esc(fmt_age(a["elapsed"]))}</span><span class="mut">{esc(KINDS.get(a["kind"], a["kind"][:2]))}</span></div>'
+                f'<h1>{esc(a["session"])}:{esc(a["window"])}</h1><p class="mut">{esc(a["title"])}</p>'
+                f'<p>{act}<a class="btn" href="/">Back</a> <a class="btn" href="{base}/files">Files</a> <a class="btn" href="{base}/review">Review diff</a> <a class="btn" href="#end">Jump to latest</a></p>{tools}{shown}'
+                f'<div id="end"></div><p class="mut">Last {n} lines. Reading this page changes nothing; Reply, Answer and Files are where you act.</p>')
+        self.send_page(page(f'{a["session"]}:{a["window"]}', body))
+
+
+def _lookup_agent(c, pane):
+    try:
+        return next((x for x in load_agents(c) if x["pane"] == pane), None)
+    except Exception:
+        return None
+
+def _age(ts):
+    return fmt_age(max(0, now() - ts))
+
+def _size(n):
+    return f"{n / 1024:.0f} KB" if n >= 1024 else f"{n} B"
+
+def feedback_text(j, v):
+    if j.get("kind") == "review":
+        what = v.get("label") or REVIEW_TYPES.get(j.get("diff_type"), "diff")
+        return f"Code review feedback on {j['file']} ({what}):\n\n{v['feedback']}"
+    return f"Plannotator feedback on {j['file']}:\n\n{v['feedback']}"
+
+JOB_LOCK = threading.Lock()
+
+
+class Pages:
+    """Step D pages, mixed into the handler."""
+
+    def agent_routes(self, c, sess, devrec, devid, method, path, query):
+        parts = path[3:].split("/")
+        seg = parts[0]
+        if not URLPANE_RE.match(seg):
+            return self.deny(404, "Not found.")
+        if len(parts) == 1 and method == "GET":
+            return self.agent(c, sess, devrec, seg, query)
+        a = _lookup_agent(c, "%" + seg[1:])
+        if not a:
+            return self.deny(404, "Not found.")
+        if parts[1:] == ["files"] and method == "GET":
+            return self.files_page(c, sess, devrec, a, seg)
+        if parts[1:] == ["review"] and method == "GET":
+            return self.review_page(c, sess, devrec, a, seg)
+        if parts[1:] == ["review", "start"] and method == "POST":
+            return self.start_review(c, sess, devrec, devid, a, seg)
+        route = (method, "/".join(parts[1:]))
+        for key, fn in ((("GET", "reply"), self.reply_form), (("POST", "reply"), self.reply_preview), (("POST", "reply/send"), self.reply_send),
+                        (("GET", "keys"), self.keys_page), (("GET", "keys/confirm"), self.keys_confirm), (("POST", "keys/press"), self.keys_press),
+                        (("POST", "keys/text"), self.keys_text)):
+            if route == key:
+                return fn(c, sess, devrec, a, seg, query)
+        if len(parts) >= 3 and parts[1] == "f" and FID_RE.match(parts[2]):
+            if len(parts) == 3 and method == "GET":
+                return self.file_page(c, sess, devrec, a, seg, parts[2])
+            if len(parts) == 4 and parts[3] == "start" and method == "POST":
+                return self.start_annotate(c, sess, devrec, devid, a, seg, parts[2])
+        return self.deny(404, "Not found.")
+
+    def files_page(self, c, sess, devrec, a, seg):
+        arts = list_artifacts(a, c)
+        base = f"/a/p{seg[1:]}"
+        rows = "".join(f'<a class="row" href="{base}/f/{esc(x["id"])}"><div class="where">{esc(x["rel"])}</div>'
+                       f'<div class="title">{esc(x["folder"])} &middot; {esc(_size(x["size"]))} &middot; {esc(_age(x["mtime"]))} ago</div></a>' for x in arts)
+        if not rows:
+            rows = ('<p class="mut">No .md, .html or .txt files found in this agent&rsquo;s folders. Code checkouts are not scanned; '
+                    'only the folder where its side shell sits and its own working folder, and only inside the allowed locations.</p>')
+        audit("view_files", dev=devrec.get("label"), pane=a["pane"], n=len(arts))
+        body = (f'<p><a href="{base}#end">&larr; {esc(a["session"])}:{esc(a["window"])}</a></p><h1>Files</h1>'
+                f'<p class="mut">Newest first. Pick one to annotate it on the phone.</p>{rows}')
+        self.send_page(page("Files", body))
+
+    def file_page(self, c, sess, devrec, a, seg, fid):
+        art = next((x for x in list_artifacts(a, c) if x["id"] == fid), None)
+        if not art:
+            return self.deny(404, "Not found.")
+        base = f"/a/p{seg[1:]}"
+        notes = ""
+        if a["state"] == "waiting":
+            notes += ('<p class="err">This agent is waiting on a question right now. You can still annotate, but the feedback cannot be typed into '
+                      'it until it is back at its prompt.</p>')
+        if not self.pin_fresh(c, sess):
+            notes += '<p class="mut">You will be asked for your PIN again before it starts.</p>'
+        body = (f'<p><a href="{base}/files">&larr; Files</a></p><h1>{esc(art["rel"])}</h1>'
+                f'<p class="mut">{esc(art["folder"])} &middot; {esc(_size(art["size"]))} &middot; changed {esc(_age(art["mtime"]))} ago</p>{notes}'
+                f'<p class="mut">This opens the file in Plannotator on your phone. Nothing is sent to the agent until you review your feedback here and tap Send.</p>'
+                f'<form method="post" action="{base}/f/{esc(fid)}/start"><input type="hidden" name="t" value="{esc(sess["csrf"])}">'
+                f'<button type="submit">Start annotating</button></form>')
+        self.send_page(page(art["rel"], body))
+
+    def start_annotate(self, c, sess, devrec, devid, a, seg, fid):
+        f = self.form()
+        if not self.csrf_ok(sess, f):
+            return self.deny()
+        base = f"/a/p{seg[1:]}"
+        if not self.pin_fresh(c, sess):
+            return self.redirect(f"/reauth?next={base}/f/{fid}")
+        art = next((x for x in list_artifacts(a, c) if x["id"] == fid), None)
+        if not art:
+            return self.deny(404, "Not found.")
+        if running_jobs() >= int(c["job_max_running"]) or jobs_last_hour() >= int(c["job_max_per_hour"]):
+            audit("annotate_refused", dev=devrec.get("label"), why="limit")
+            return self.send_page(page("Busy", '<h1>Too many sessions</h1><p class="err">Too many annotation sessions are open or were started in the last hour. Finish or cancel one first.</p>', status=429))
+        try:
+            jid = start_job(c, devid, a, art)
+        except Exception:
+            audit("annotate_refused", dev=devrec.get("label"), why="spawn")
+            return self.send_page(page("Could not start", '<h1>Could not start</h1><p class="err">The annotation helper could not be started.</p>', status=500))
+        audit("annotate_start", dev=devrec.get("label"), pane=a["pane"], job=jid, file=art["id"])
+        return self.redirect(f"/job/{jid}")
+
+    def review_page(self, c, sess, devrec, a, seg):
+        repos = agent_repos(a, c)
+        base = f"/a/p{seg[1:]}"
+        csrf = f'<input type="hidden" name="t" value="{esc(sess["csrf"])}">'
+        notes = ""
+        if a["state"] == "waiting":
+            notes += '<p class="err">This agent is waiting on a question right now. You can still review, but the feedback cannot be typed into it until it is back at its prompt.</p>'
+        if not self.pin_fresh(c, sess):
+            notes += '<p class="mut">You will be asked for your PIN again before it starts.</p>'
+        cards = ""
+        for r in repos:
+            btns = "".join(f'<form method="post" action="{base}/review/start" style="display:inline">{csrf}<input type="hidden" name="r" value="{esc(r["id"])}">'
+                           f'<input type="hidden" name="d" value="{esc(k)}"><button type="submit">{esc(v)}</button></form> ' for k, v in REVIEW_TYPES.items())
+            cards += (f'<div class="row"><div class="where">{esc(r["name"])}</div><div class="title">branch {esc(r["branch"] or "?")}</div>'
+                      f'<div style="margin-top:8px">{btns}</div></div>')
+        if not cards:
+            cards = ('<p class="mut">No git repository found for this agent inside the allowed folders. Only the agent&rsquo;s own working folder and '
+                     'the folders of its other panes are considered.</p>')
+        audit("view_review", dev=devrec.get("label"), pane=a["pane"], n=len(repos))
+        body = (f'<p><a href="{base}#end">&larr; {esc(a["session"])}:{esc(a["window"])}</a></p><h1>Review a diff</h1>{notes}'
+                f'<p class="mut">The diff is made on the Mac as a fixed snapshot and shown in Plannotator. The page can only show it and take your comments: '
+                f'it cannot stage files, fetch, open apps, read other files or use AI.</p>{cards}')
+        self.send_page(page("Review a diff", body))
+
+    def start_review(self, c, sess, devrec, devid, a, seg):
+        f = self.form()
+        if not self.csrf_ok(sess, f):
+            return self.deny()
+        base = f"/a/p{seg[1:]}"
+        if not self.pin_fresh(c, sess):
+            return self.redirect(f"/reauth?next={base}/review")
+        dtype = f.get("d", "")
+        if dtype not in REVIEW_TYPES:
+            return self.deny(400, "Bad request.")
+        repo = next((r for r in agent_repos(a, c) if r["id"] == f.get("r", "")), None)
+        if not repo:
+            return self.deny(404, "Not found.")
+        if running_jobs() >= int(c["job_max_running"]) or jobs_last_hour() >= int(c["job_max_per_hour"]):
+            audit("annotate_refused", dev=devrec.get("label"), why="limit")
+            return self.send_page(page("Busy", '<h1>Too many sessions</h1><p class="err">Too many annotation sessions are open or were started in the last hour. Finish or cancel one first.</p>', status=429))
+        try:
+            jid = start_job(c, devid, a, repo=repo, dtype=dtype)
+        except Exception:
+            audit("annotate_refused", dev=devrec.get("label"), why="spawn")
+            return self.send_page(page("Could not start", '<h1>Could not start</h1><p class="err">The review helper could not be started.</p>', status=500))
+        audit("review_start", dev=devrec.get("label"), pane=a["pane"], job=jid, repo=repo["id"], diff=dtype)
+        return self.redirect(f"/job/{jid}")
+
+    def job_routes(self, c, sess, devrec, devid, method, path):
+        parts = path[5:].split("/")
+        j = job_load(parts[0])
+        if not j or j.get("dev") != devid:
+            return self.deny(404, "Not found.")
+        if len(parts) == 1 and method == "GET":
+            return self.job_page(c, sess, devrec, j)
+        if len(parts) == 2 and parts[1] == "send" and method == "POST":
+            return self.job_send(c, sess, devrec, j)
+        if len(parts) == 2 and parts[1] == "cancel" and method == "POST":
+            return self.job_cancel(c, sess, devrec, j)
+        return self.deny(404, "Not found.")
+
+    def job_page(self, c, sess, devrec, j):
+        v = job_view(j)
+        st = v["state"]
+        csrf = f'<input type="hidden" name="t" value="{esc(sess["csrf"])}">'
+        head = f'<p><a href="/">&larr; Agents</a></p><h1>{esc(j["rel"])}</h1><p class="mut">for {esc(j["label"])}</p>'
+        body = head
+        if st == "starting":
+            body += '<p>Starting&hellip;</p>'
+        elif st == "waiting":
+            body += ('<p>Ready. Open it, add your comments, and submit in Plannotator. This page updates by itself.</p>'
+                     + (f'<p><a class="btn" href="{esc(v["url"])}" target="_blank" rel="noopener noreferrer">Open annotation</a></p>' if v["url"]
+                        else '<p class="err">The session reported an address that is not allowed, so no link is shown.</p>')
+                     + f'<p class="mut">Back from Plannotator and nothing changed? Safari pauses this page while you are on another tab.</p>'
+                     + f'<p><a class="btn" href="/job/{esc(j["id"])}">Check now</a></p>'
+                     + f'<form method="post" action="/job/{esc(j["id"])}/cancel">{csrf}<button type="submit">Cancel</button></form>')
+        elif st == "finished":
+            body += self.finished_block(c, sess, j, v, csrf)
+        elif st == "ended":
+            body += '<p class="err">The session ended without a decision (it was cancelled or timed out).</p>'
+        else:
+            try:
+                tail = clean_line(open(os.path.join(JOBS_DIR, j["id"] + ".err"), errors="replace").read()[-300:], 160)
+            except OSError:
+                tail = ""
+            body += f'<p class="err">It could not start{(": " + esc(tail)) if tail else "."}</p>'
+        self.send_page(page("Annotation", body, refresh=3 if st in ("starting", "waiting") else 0))
+
+    def finished_block(self, c, sess, j, v, csrf):
+        dec = v["decision"]
+        if dec not in ("annotated", "approved") or not v["feedback"]:
+            return {"approved": "<p>Approved with no comments. Nothing to send.</p>", "dismissed": "<p>Dismissed. Nothing to send.</p>"}.get(
+                dec, "<p>No feedback was recorded. Nothing to send.</p>")
+        text = feedback_text(j, v)
+        out = f'<p>Decision: <b>{esc(dec)}</b>, {int(v["count"])} comment(s).</p>'
+        sent = j.get("sent", "")
+        if sent == "sent":
+            return out + '<p class="done">Sent to the agent.</p>'
+        if sent == "pasted":
+            return out + '<p class="err">The text was pasted into the agent&rsquo;s input but Enter was not pressed. Open the agent and press Enter, or clear the input.</p>'
+        if sent == "sending":
+            return out + '<p>Sending&hellip;</p>'
+        if len(text) > MAX_FEEDBACK:
+            return out + '<p class="err">The feedback is too long to send from the phone.</p>'
+        ok, why, info = pane_guard(c, j["pane"], "type")
+        out += f'<p>This exact text would be typed into <b>{esc(j["label"])}</b>, followed by Enter:</p><pre>{esc(text)}</pre>'
+        if not ok:
+            return out + f'<p class="err">It cannot be sent right now: {esc(why)}.</p><p class="mut">Reload this page when the agent is back at its prompt.</p>'
+        return out + (f'<p class="mut">The agent will act on this text. It runs with permissions bypassed.</p>'
+                      f'<form method="post" action="/job/{esc(j["id"])}/send">{csrf}<button type="submit">Send to the agent</button></form>')
+
+    def job_send(self, c, sess, devrec, j):
+        f = self.form()
+        if not self.csrf_ok(sess, f):
+            return self.deny()
+        if not self.pin_fresh(c, sess):
+            return self.redirect(f"/reauth?next=/job/{j['id']}")
+        v = job_view(j)
+        if v["state"] != "finished" or v["decision"] not in ("annotated", "approved") or not v["feedback"] or len(feedback_text(j, v)) > MAX_FEEDBACK:
+            return self.deny(409, "Nothing to send.")
+        with JOB_LOCK:
+            fresh = job_load(j["id"]) or j
+            if fresh.get("sent"):
+                return self.deny(409, "Already sent.")
+            fresh["sent"] = "sending"
+            job_save(fresh)
+        state, msg = send_feedback(c, fresh, v)
+        fresh["sent"] = state
+        fresh["sent_at"] = now()
+        job_save(fresh)
+        audit("send_enter", dev=devrec.get("label"), pane=fresh["pane"], job=fresh["id"], result=state or "refused")
+        return self.redirect(f"/job/{j['id']}") if state else self.send_page(page("Not sent", f'<h1>Not sent</h1><p class="err">{esc(msg)}</p><p><a href="/job/{esc(j["id"])}">Back</a></p>', status=409))
+
+    # ---------------- E1: Reply (a message for an idle agent)
+    def _agent_head(self, a, seg, title):
+        base = f"/a/p{seg[1:]}"
+        return base, f'<p><a href="{base}#end">&larr; {esc(a["session"])}:{esc(a["window"])}</a></p><h1>{esc(title)}</h1>'
+
+    def reply_form(self, c, sess, devrec, a, seg, query=""):
+        base, head = self._agent_head(a, seg, "Reply")
+        if not self.pin_fresh(c, sess):
+            return self.redirect(f"/reauth?next={base}/reply")
+        ok, why, info = pane_guard(c, a["pane"], "type")
+        if not ok:
+            more = f'<p><a class="btn" href="{base}/keys">Answer the question</a></p>' if info.get("state") == "dialog" or a["state"] == "waiting" else ""
+            return self.send_page(page("Reply", head + f'<p class="err">A reply cannot be typed right now: {esc(why)}.</p>{more}<p class="mut">Reload this page when the agent is back at an empty prompt.</p>'))
+        body = head + (f'<p class="mut">Typed into <b>{esc(a["session"])}:{esc(a["window"])}</b> as a message, then Enter. You see the exact text before anything is sent.</p>'
+                       f'<form method="post" action="{base}/reply"><input type="hidden" name="t" value="{esc(sess["csrf"])}">'
+                       f'<textarea name="text" maxlength="{REPLY_MAX}" required autocapitalize="sentences"></textarea>'
+                       '<button type="submit">Preview</button></form>')
+        self.send_page(page("Reply", body))
+
+    def reply_preview(self, c, sess, devrec, a, seg, query=""):
+        f = self.form(REPLY_BODY)
+        if not self.csrf_ok(sess, f):
+            return self.deny()
+        base, head = self._agent_head(a, seg, "Reply")
+        if not self.pin_fresh(c, sess):
+            return self.redirect(f"/reauth?next={base}/reply")
+        text, err = check_message(f.get("text", ""), REPLY_MAX)
+        if err:
+            return self.send_page(page("Reply", head + f'<p class="err">{esc(err)}</p><p><a class="btn" href="{base}/reply">Back</a></p>', status=400))
+        ok, why, _info = pane_guard(c, a["pane"], "type")
+        if not ok:
+            return self.send_page(page("Reply", head + f'<p class="err">Cannot be sent right now: {esc(why)}.</p><pre>{esc(text)}</pre><p><a class="btn" href="{base}/reply">Back</a></p>', status=409))
+        nonce = pysecrets.token_urlsafe(12)
+        with STATE["lock"]:
+            nn = STATE.setdefault("nonces", {})
+            for k in [k for k, v in nn.items() if v[0] < now()]:
+                nn.pop(k, None)
+            nn[nonce] = (now() + 600, a["pane"], sha(text))
+        body = head + (f'<p>This exact text will be typed into <b>{esc(a["session"])}:{esc(a["window"])}</b>, followed by Enter:</p><pre>{esc(text)}</pre>'
+                       '<p class="mut">The agent will act on it, and it may be running with permissions bypassed. Its input box is empty now.</p>'
+                       f'<form method="post" action="{base}/reply/send"><input type="hidden" name="t" value="{esc(sess["csrf"])}">'
+                       f'<input type="hidden" name="n" value="{esc(nonce)}"><textarea name="text" hidden>{esc(text)}</textarea>'
+                       '<button type="submit">Send to the agent</button></form>'
+                       f'<p><a href="{base}/reply">Edit</a></p>')
+        self.send_page(page("Reply", body))
+
+    def reply_send(self, c, sess, devrec, a, seg, query=""):
+        f = self.form(REPLY_BODY)
+        if not self.csrf_ok(sess, f):
+            return self.deny()
+        base, head = self._agent_head(a, seg, "Reply")
+        if not self.pin_fresh(c, sess):
+            return self.redirect(f"/reauth?next={base}/reply")
+        text, err = check_message(f.get("text", ""), REPLY_MAX)
+        with STATE["lock"]:
+            held = STATE.setdefault("nonces", {}).pop(f.get("n", ""), None)
+        if err or not held or held[0] < now() or held[1] != a["pane"] or not hmac.compare_digest(held[2], sha(text)):
+            audit("reply_refused", dev=devrec.get("label"), pane=a["pane"], why="nonce_or_text")
+            return self.send_page(page("Not sent", head + f'<p class="err">Not sent: this preview expired or was already used. Start again.</p><p><a class="btn" href="{base}/reply">Reply</a></p>', status=409))
+        if not rate_ok("reply", c["replies_per_10min"], 600):
+            return self.deny(429, "Slow down.")
+        state, msg = paste_and_enter(c, a["pane"], text, "ph-reply-" + pysecrets.token_hex(4))
+        audit("reply_send", dev=devrec.get("label"), pane=a["pane"], chars=len(text), result=state or "refused")
+        if state == "sent":
+            return self.send_page(page("Sent", head + f'<p class="done">Sent.</p><p><a class="btn" href="{base}#end">See the agent</a></p>'))
+        return self.send_page(page("Not sent", head + f'<p class="err">{esc(msg)}</p><p><a class="btn" href="{base}#end">See the agent</a></p>', status=409))
+
+    # ---------------- E2: Keypad (answering an open question or permission dialog)
+    def _dialog_view(self, c, a):
+        try:
+            raw, width = capture_raw(a["pane"], c, 120)
+            return render_pane(raw, width, "smart", 40, int(c["capture_max_chars"])) or '<p class="mut">Nothing to show.</p>'
+        except Exception:
+            return '<p class="err">Could not read this agent&rsquo;s screen.</p>'
+
+    def keys_page(self, c, sess, devrec, a, seg, query=""):
+        base, head = self._agent_head(a, seg, "Answer")
+        if not self.pin_fresh(c, sess):
+            return self.redirect(f"/reauth?next={base}/keys")
+        ok, why, info = pane_guard(c, a["pane"], "keys")
+        shown = self._dialog_view(c, a)
+        audit("view_keys", dev=devrec.get("label"), pane=a["pane"], dialog=ok)
+        if not ok:
+            return self.send_page(page("Answer", head + f'<p class="err">Nothing to answer: {esc(why)}.</p>{shown}<p><a class="btn" href="{base}/keys">Look again</a> <a class="btn" href="{base}#end">See the agent</a></p>'))
+        csrf = f'<input type="hidden" name="t" value="{esc(sess["csrf"])}"><input type="hidden" name="fp" value="{esc(info["fp"])}">'
+        def nav(label, k):
+            return f'<form method="post" action="{base}/keys/press">{csrf}<input type="hidden" name="k" value="{k}"><button class="nav" type="submit">{label}</button></form>'
+        def commit(label, k, cls="go"):
+            return f'<a class="btn {cls}" href="{base}/keys/confirm?k={k}">{label}</a>'
+        oc = a["kind"] == "opencode"
+        pad = ('<div class="pad">' + nav("&larr;", "Left") + nav("&uarr;", "Up") + nav("&rarr;", "Right")
+               + nav("Tab", "Tab") + nav("&darr;", "Down") + nav("Space", "Space") + '</div>')
+        pad += '<div class="pad">' + commit("Enter", "Enter") + commit("Esc (cancel)", "Esc", "no") + '<span></span></div>'
+        if not oc:
+            pad += '<div class="pad">' + "".join(commit(str(i), str(i)) for i in range(1, 10)) + '</div>'
+        hint = ('<p class="mut">Arrows move the highlight (nothing is answered). Tab can open a text field to amend a permission request (Claude). Enter answers the highlighted choice. '
+                + ('This agent ignores number keys.' if oc else 'In many dialogs a number answers that choice immediately.') + ' Enter, Esc and numbers ask you to confirm first.</p>')
+        text = (f'<details><summary>Type text into the dialog</summary><form method="post" action="{base}/keys/text">{csrf}'
+                f'<input type="text" name="text" maxlength="{KEYS_TEXT_MAX}" autocapitalize="none" autocomplete="off"><button type="submit">Type it (no Enter)</button></form>'
+                '<p class="mut">For a dialog that has a type-your-own-answer line: highlight that line, type here, then press Enter above.</p></details>')
+        self.send_page(page("Answer", head + f'<div class="stop"><b>A dialog is open.</b> This is the screen as it is right now.</div>{shown}{hint}{pad}{text}'
+                                           f'<p><a href="{base}/keys">Look again</a> &middot; <a href="{base}#end">See the agent</a></p>'))
+
+    def keys_confirm(self, c, sess, devrec, a, seg, query=""):
+        base, head = self._agent_head(a, seg, "Confirm")
+        if not self.pin_fresh(c, sess):
+            return self.redirect(f"/reauth?next={base}/keys")
+        k = (parse_qs(query).get("k") or [""])[0]
+        if k not in COMMIT_KEYS or (a["kind"] == "opencode" and k.isdigit()):
+            return self.deny(404, "Not found.")
+        ok, why, info = pane_guard(c, a["pane"], "keys")
+        shown = self._dialog_view(c, a)
+        if not ok:
+            return self.send_page(page("Confirm", head + f'<p class="err">Nothing to answer: {esc(why)}.</p>{shown}<p><a class="btn" href="{base}/keys">Back</a></p>'))
+        what = {"Enter": "Enter, which answers whichever choice is highlighted", "Esc": "Esc, which cancels or rejects"}.get(k, f"the number {k}, which in many dialogs answers choice {k} immediately")
+        body = head + (f'<div class="stop"><b>Press {esc(k)}?</b> It will press {esc(what)}. The agent may be running with permissions bypassed.</div>{shown}'
+                       f'<form method="post" action="{base}/keys/press"><input type="hidden" name="t" value="{esc(sess["csrf"])}"><input type="hidden" name="fp" value="{esc(info["fp"])}">'
+                       f'<input type="hidden" name="k" value="{esc(k)}"><input type="hidden" name="ok" value="1"><button class="go" type="submit">Press {esc(k)}</button></form>'
+                       f'<p><a class="btn" href="{base}/keys">Cancel</a></p>')
+        self.send_page(page("Confirm", body))
+
+    def keys_press(self, c, sess, devrec, a, seg, query=""):
+        f = self.form()
+        if not self.csrf_ok(sess, f):
+            return self.deny()
+        base, head = self._agent_head(a, seg, "Answer")
+        if not self.pin_fresh(c, sess):
+            return self.redirect(f"/reauth?next={base}/keys")
+        k = f.get("k", "")
+        key = NAV_KEYS.get(k) or COMMIT_KEYS.get(k)
+        if not key or (k in COMMIT_KEYS and f.get("ok") != "1") or (a["kind"] == "opencode" and k.isdigit()):
+            return self.deny(400, "Bad request.")
+        if not rate_ok("keys", c["keys_per_minute"], 60):
+            return self.deny(429, "Slow down.")
+        good, msg = press_key(c, a["pane"], key, f.get("fp", ""))
+        audit("key_press", dev=devrec.get("label"), pane=a["pane"], key=k, ok=good)
+        if not good:
+            return self.send_page(page("Not pressed", head + f'<p class="err">{esc(msg)}</p><p><a class="btn" href="{base}/keys">Look again</a></p>', status=409))
+        time.sleep(0.6)
+        return self.redirect(f"{base}/keys")
+
+    def keys_text(self, c, sess, devrec, a, seg, query=""):
+        f = self.form(6000)
+        if not self.csrf_ok(sess, f):
+            return self.deny()
+        base, head = self._agent_head(a, seg, "Answer")
+        if not self.pin_fresh(c, sess):
+            return self.redirect(f"/reauth?next={base}/keys")
+        text, err = check_message(f.get("text", ""), KEYS_TEXT_MAX, multiline=False)
+        if err:
+            return self.send_page(page("Answer", head + f'<p class="err">{esc(err)}</p><p><a class="btn" href="{base}/keys">Back</a></p>', status=400))
+        if not rate_ok("keys", c["keys_per_minute"], 60):
+            return self.deny(429, "Slow down.")
+        good, msg = paste_to_dialog(c, a["pane"], text, f.get("fp", ""), "ph-keys-" + pysecrets.token_hex(4))
+        audit("key_text", dev=devrec.get("label"), pane=a["pane"], chars=len(text), ok=good)
+        if not good:
+            return self.send_page(page("Not typed", head + f'<p class="err">{esc(msg)}</p><p><a class="btn" href="{base}/keys">Look again</a></p>', status=409))
+        time.sleep(0.4)
+        return self.redirect(f"{base}/keys")
+
+    def job_cancel(self, c, sess, devrec, j):
+        if not self.csrf_ok(sess, self.form()):
+            return self.deny()
+        try:
+            os.kill(int(j["pid"]), 15)
+        except (ProcessLookupError, ValueError, PermissionError):
+            pass
+        audit("annotate_cancel", dev=devrec.get("label"), job=j["id"])
+        return self.redirect(f"/job/{j['id']}")
+
+
+for _name in [n for n in dir(Pages) if not n.startswith('__')]:
+    setattr(Handler, _name, getattr(Pages, _name))
+
+
+class Server(ThreadingHTTPServer):
+    daemon_threads = True
+    allow_reuse_address = True
+    request_queue_size = 32
+
+
+# ------------------------------------------------------------------ commands
+def cmd_serve(args):
+    c = cfg()
+    bad = config_problem(c)
+    if bad:
+        print(f"phone-hub: not starting: {bad}", file=sys.stderr)
+        return 2
+    private_dir(STATE_DIR)
+    private_dir(CONFIG_DIR)
+    try:
+        srv = Server(("127.0.0.1", int(c["port"])), Handler)
+    except OSError as e:
+        print(f"phone-hub: cannot listen on 127.0.0.1:{c['port']}: {e}", file=sys.stderr)
+        return 1
+    audit("server_start", port=srv.server_address[1])
+    with open(os.path.join(STATE_DIR, "server.pid"), "w") as f:
+        f.write(str(os.getpid()))
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    return 0
+
+def healthy(port, timeout=1.0):
+    try:
+        conn = http.client.HTTPConnection("127.0.0.1", int(port), timeout=timeout)
+        conn.request("GET", "/healthz")
+        r = conn.getresponse()
+        ok = r.status == 200 and r.read() == b"ok"
+        conn.close()
+        return ok
+    except Exception:
+        return False
+
+SUPERVISOR_PID = os.path.join(STATE_DIR, "supervisor.pid")
+
+def supervisor_alive():
+    """True only if the pid file names a live process whose command line is our `supervise` (a recycled pid does not count)."""
+    try:
+        pid = int(open(SUPERVISOR_PID).read().strip())
+        os.kill(pid, 0)
+        cmd = subprocess.run(["ps", "-p", str(pid), "-o", "command="], capture_output=True, text=True, timeout=5).stdout
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return False
+    return "supervise" in cmd and os.path.basename(os.path.abspath(__file__)) in cmd
+
+def cmd_supervise(args):
+    """Keep `serve` running. When it exits, wait (2 s, doubling to 30 s while it keeps dying within a minute) and start it again.
+    SIGTERM stops the server and then this loop, so `kill <supervisor.pid>` really stops everything."""
+    private_dir(STATE_DIR)
+    with open(SUPERVISOR_PID, "w") as f:
+        f.write(str(os.getpid()))
+    box, stopping = {"p": None}, []
+    def stop(signum, frame):
+        stopping.append(signum)
+        p = box["p"]
+        if p is not None and p.poll() is None:
+            p.terminate()
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGINT, stop)
+    delay = 2
+    while not stopping:
+        t0 = time.time()
+        box["p"] = subprocess.Popen([sys.executable, os.path.abspath(__file__), "serve"], stdin=subprocess.DEVNULL, close_fds=True)
+        if stopping:
+            box["p"].terminate()
+        rc = box["p"].wait()
+        if stopping:
+            break
+        if rc == 2:                     # a configuration error: starting again cannot fix it
+            audit("supervisor_stop", reason="config")
+            break
+        up = int(time.time() - t0)
+        audit("server_exit", rc=rc, up_secs=up)
+        delay = 2 if up > 60 else min(delay * 2, 30)
+        end = time.time() + delay
+        while time.time() < end and not stopping:
+            time.sleep(0.2)
+    try:
+        os.unlink(SUPERVISOR_PID)
+    except OSError:
+        pass
+    return 0
+
+def cmd_ensure(args):
+    c = cfg()
+    if healthy(c["port"]):
+        print("phone-hub: already running")
+        return 0
+    bad = config_problem(c)
+    if bad:
+        print(f"phone-hub: not starting: {bad}", file=sys.stderr)
+        return 1
+    private_dir(STATE_DIR)
+    if not supervisor_alive():
+        log = open(SERVER_LOG, "ab")
+        subprocess.Popen([sys.executable, os.path.abspath(__file__), "supervise"], stdin=subprocess.DEVNULL, stdout=log, stderr=log,
+                         start_new_session=True, close_fds=True)
+    for _ in range(80):                 # 12 s: covers the supervisor's own 2 s pause after a restart
+        time.sleep(0.15)
+        if healthy(c["port"]):
+            print("phone-hub: started")
+            return 0
+    print("phone-hub: did not start (see server.log)", file=sys.stderr)
+    return 1
+
+def cmd_restart(args):
+    """Stop the server process. The supervisor starts it again from the file on disk (new code, same pairing and PIN)."""
+    try:
+        os.kill(int(open(os.path.join(STATE_DIR, "server.pid")).read().strip()), 15)
+    except (OSError, ValueError):
+        pass
+    for _ in range(30):
+        if not healthy(cfg()["port"]):
+            break
+        time.sleep(0.1)
+    return cmd_ensure(args)
+
+WEAK = {"123456", "1234567", "12345678", "654321", "7654321", "87654321", "111111", "000000", "121212", "112233", "123123"}
+
+def cmd_set_pin(args):
+    c = cfg()
+    if args.stdin:
+        pin = sys.stdin.readline().rstrip("\n")
+    else:
+        pin = getpass.getpass("New PIN (digits, at least %d): " % c["pin_min_len"])
+        if getpass.getpass("Again: ") != pin:
+            print("phone-hub: the two entries differ", file=sys.stderr)
+            return 1
+    if not pin.isdigit() or len(pin) < int(c["pin_min_len"]):
+        print(f"phone-hub: the PIN must be digits only, at least {c['pin_min_len']} long", file=sys.stderr)
+        return 1
+    if pin in WEAK or len(set(pin)) == 1:
+        print("phone-hub: that PIN is too easy to guess", file=sys.stderr)
+        return 1
+    salt = pysecrets.token_bytes(16)
+    with SLOCK:
+        d = sload()
+        d["pin"] = {"salt": base64.b64encode(salt).decode(), "iters": PIN_ITERS, "hash": base64.b64encode(hash_pin(pin, salt)).decode()}
+        d["fail"] = {"global": {"n": 0, "until": 0}, "dev": {}}
+        ssave(d)
+    audit("pin_set")
+    print("phone-hub: PIN set")
+    return 0
+
+def cmd_pair(args):
+    c = cfg()
+    code = words_code()
+    with SLOCK:
+        d = sload()
+        d["pair"] = {"hash": sha(code), "expires": now() + int(c["pair_ttl_secs"]), "fails": 0}
+        d.pop("pair_locked_until", None)
+        ssave(d)
+    audit("pair_started")
+    print(f"\n  1. On the phone, open  https://{c['host']}  (best: from the Home Screen icon, see the page's tip)")
+    print(f"  2. Enter this code:    {code}")
+    print(f"     Valid {int(c['pair_ttl_secs']) // 60} minutes, works once.\n")
+    return 0
+
+def cmd_devices(args):
+    d = sload()
+    if not d["devices"]:
+        print("no paired devices")
+    for h, r in d["devices"].items():
+        print(f"{h[:8]}  {r.get('label','?'):<20} paired {iso(r.get('created'))}  last seen {iso(r.get('last_seen'))}")
+    return 0
+
+def cmd_revoke(args):
+    with SLOCK:
+        d = sload()
+        hit = [h for h in d["devices"] if h.startswith(args.id)]
+        if len(hit) != 1:
+            print("phone-hub: no unique device with that id", file=sys.stderr)
+            return 1
+        label = d["devices"][hit[0]].get("label")
+        del d["devices"][hit[0]]
+        ssave(d)
+    audit("revoke", dev=label)
+    print(f"phone-hub: revoked {label}. Sessions of that device end at the next request.")
+    return 0
+
+def cmd_off(args):
+    private_dir(STATE_DIR)
+    open(DISABLED_FILE, "w").close()
+    audit("kill_switch_on")
+    print("phone-hub: OFF (everything answers 503)")
+    return 0
+
+def cmd_on(args):
+    try:
+        os.unlink(DISABLED_FILE)
+    except FileNotFoundError:
+        pass
+    audit("kill_switch_off")
+    print("phone-hub: on")
+    return 0
+
+def cmd_status(args):
+    c = cfg()
+    d = sload()
+    print(f"server      : {'running' if healthy(c['port']) else 'not running'} on 127.0.0.1:{c['port']}")
+    print(f"kill switch : {'OFF (503)' if os.path.exists(DISABLED_FILE) else 'on'}")
+    print(f"config      : {config_problem(c) or 'login and host set'}")
+    print(f"PIN         : {'set' if d.get('pin') else 'NOT set (phone-hub set-pin)'}")
+    print(f"devices     : {len(d['devices'])}")
+    p = d.get("pair") or {}
+    print(f"pairing     : {'code active' if p and now() < p.get('expires', 0) else 'none active'}")
+    try:
+        ts = subprocess.run(["tailscale", "serve", "status"], capture_output=True, text=True, timeout=6).stdout.strip().splitlines()
+        print("tailnet     : " + (ts[0] if ts else "(nothing published)"))
+    except Exception:
+        print("tailnet     : (could not ask tailscale)")
+    return 0
+
+def cmd_log(args):
+    try:
+        lines = open(AUDIT_FILE).read().splitlines()[-args.n:]
+    except OSError:
+        lines = []
+    print("\n".join(lines) or "(empty)")
+    return 0
+
+def cmd_selftest(args):
+    c = cfg()
+    if not os.environ.get("PHONE_HUB_STATUS_JSON"):
+        # facts about how workmux sees THIS environment (no agent text is printed)
+        try:
+            r = run_workmux(["status", "--all", "--json"])
+            info = f"workmux exit {r.returncode}, {len(r.stdout)} bytes out"
+            try:
+                j = json.loads(r.stdout)
+                info += f", tmux instance {j.get('context', {}).get('instance')}, state files matching {j.get('state_files_matching_context')} of {j.get('state_files_total')}"
+            except ValueError:
+                info += ", output is not JSON: " + clean_line(r.stderr or r.stdout, 160)
+            print("INFO " + info)
+        except Exception as e:
+            print(f"INFO workmux could not run: {type(e).__name__}")
+        print("INFO TMUX set: " + ("yes" if os.environ.get("TMUX") else "no") + f", LANG={os.environ.get('LANG')}")
+    try:
+        agents = load_agents(c)
+    except Exception as e:
+        print(f"FAIL agents: {type(e).__name__}")
+        return 1
+    print(f"OK agents: {len(agents)} (" + ", ".join(sorted({a['state'] for a in agents})) + ")")
+    if agents:
+        try:
+            raw, w = capture_raw(agents[0]["pane"], c, int(c["capture_lines"]) + 80)
+            n = len(render_pane(raw, w, "smart", int(c["capture_lines"]), int(c["capture_max_chars"])))
+            print(f"OK capture: {n} characters of page rendered from the first agent's pane (content not printed)")
+        except Exception as e:
+            print(f"FAIL capture: {type(e).__name__}")
+            return 1
+    return 0
+
+def main():
+    ap = argparse.ArgumentParser(prog="phone-hub", description=__doc__.split("\n")[0])
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    for name, fn in (("serve", cmd_serve), ("ensure", cmd_ensure), ("restart", cmd_restart), ("supervise", cmd_supervise), ("pair", cmd_pair), ("devices", cmd_devices), ("off", cmd_off),
+                     ("on", cmd_on), ("status", cmd_status), ("selftest", cmd_selftest)):
+        sub.add_parser(name).set_defaults(fn=fn)
+    p = sub.add_parser("set-pin"); p.add_argument("--stdin", action="store_true", help=argparse.SUPPRESS); p.set_defaults(fn=cmd_set_pin)
+    p = sub.add_parser("revoke"); p.add_argument("id"); p.set_defaults(fn=cmd_revoke)
+    p = sub.add_parser("log"); p.add_argument("-n", type=int, default=30); p.set_defaults(fn=cmd_log)
+    args = ap.parse_args()
+    return args.fn(args)
+
+if __name__ == "__main__":
+    sys.exit(main())

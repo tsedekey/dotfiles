@@ -99,6 +99,16 @@ info "Yazi configuration"
 link_file "$DOTFILES_DIR/yazi/theme.toml"      "$HOME/.config/yazi/theme.toml"
 echo ""
 
+# --- Phone helpers (see tmux/phone/README.md) ---
+# wm-phone: agent picker for a small screen (`wm-phone --home` undoes it). ph-annotate: starts Plannotator for the phone.
+# phone-hub: the private phone web page for the agents (needs a one-time setup, see the README; it does nothing until set up).
+# Symlinked into ~/.local/bin so they are plain commands everywhere.
+info "Phone helpers"
+link_file "$DOTFILES_DIR/tmux/phone/wm-phone"  "$HOME/.local/bin/wm-phone"
+link_file "$DOTFILES_DIR/tmux/phone/ph-annotate" "$HOME/.local/bin/ph-annotate"
+link_file "$DOTFILES_DIR/tmux/phone/phone-hub"   "$HOME/.local/bin/phone-hub"
+echo ""
+
 # --- Agent icon font (Claude / OpenCode logos for the workmux sidebar) ---
 # Copied, not symlinked: CoreText is not guaranteed to follow symlinks in ~/Library/Fonts.
 # Ghostty maps U+E400-E403 to it (font-codepoint-map in ghostty/config). Rebuild with

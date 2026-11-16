@@ -1,0 +1,295 @@
+#!/usr/bin/env bash
+# ph-annotate: let the phone annotate one artifact (markdown / html / text) over the tailnet.
+#
+#   ph-annotate FILE [--pane %N] [--result-file PATH] [--timeout-secs N]
+#   ph-annotate --review DIR [--diff-type uncommitted|branch|last-commit] [--result-file PATH] [--timeout-secs N]
+#
+# REVIEW MODE reviews a git working tree's DIFF on the phone. DIR must be the top folder of a git working tree inside the allowed
+# repo roots (default ~/dev and ~/dotfiles). The helper builds the patch ITSELF with git's program-running features switched off
+# (no fsmonitor, no hooks, no external diff drivers, no textconv), skips secret-looking and binary untracked files, refuses an
+# empty diff or one over 3 MB, and hands Plannotator a fixed patch file (`plannotator review --patch-file`). A static patch has
+# no repository behind it, so the page cannot stage files, fetch, open apps or read files; AI features are disabled as well.
+#   uncommitted = working tree vs HEAD (+ new untracked files)    last-commit = HEAD vs its parent
+#   branch      = working tree vs the point where this branch left main/master/origin's default branch
+#
+# What it does, in order:
+#   1. Checks FILE: a regular file, .md/.markdown/.html/.htm/.txt, <= 5 MB, and inside an allowed root
+#      (default: ~/.local/share/camunda and ~/dev/camunda/worktrees). Symlinks are resolved first, so a link
+#      cannot lead outside. Secret-looking names (.env*, *.pem, *.key, id_*) are refused.
+#   2. Picks a free port from 8444-8450 (the only range the Tailscale access rules let the phone reach;
+#      Plannotator would otherwise choose a random port the phone cannot use) and takes a lock on it.
+#      Leftover tailnet publications from an interrupted earlier run are removed first.
+#   3. Runs `plannotator annotate FILE --tailscale --browser none --json` on that port and prints
+#          URL <https://<machine>.<tailnet>.ts.net:PORT>
+#      The phone opens that address in Safari (Tailscale on).
+#   4. Waits for the decision (default 30 minutes). Whatever happens, it ALWAYS stops Plannotator and removes
+#      the tailnet publication and the lock (finish, timeout, Ctrl-C, kill, crash of the caller).
+#   5. If the decision carries feedback and --pane is given, PASTES it into that pane exactly like the
+#      desk picker (`prefix a`) does: "Plannotator feedback on <file>:" + the comments, bracketed paste,
+#      NO Enter. Refused when the pane is gone, is a shell, or the feedback exceeds 20000 characters.
+#
+# stdout (one fact per line, for scripts such as the phone hub):
+#   URL <url>            PORT <n>
+#   DECISION <annotated|approved|dismissed|none>
+#   DELIVERED <pane>  |  NOT_DELIVERED <reason>
+# Exit codes: 0 finished, 2 usage, 3 file refused, 4 no free port, 5 Plannotator did not start,
+#             6 timed out, 7 feedback not delivered.
+# --result-file writes the details (including the feedback text) as JSON, mode 600.
+#
+# Env (mostly tests): PH_ANNOTATE_PLANNOTATOR (binary), PH_ANNOTATE_STATE_DIR, PH_ANNOTATE_ROOTS (colon list),
+#   PH_ANNOTATE_PORT_LO / PH_ANNOTATE_PORT_HI, PH_ANNOTATE_TIMEOUT_SECS, PH_ANNOTATE_MAX_FEEDBACK.
+
+set -u
+export PATH="/opt/homebrew/bin:$HOME/.local/bin:/usr/local/bin:$PATH"
+
+PLANNOTATOR_BIN="${PH_ANNOTATE_PLANNOTATOR:-plannotator}"
+STATE="${PH_ANNOTATE_STATE_DIR:-$HOME/.local/state/ph-annotate}"
+ROOTS="${PH_ANNOTATE_ROOTS:-$HOME/.local/share/camunda:$HOME/dev/camunda/worktrees}"
+PORT_LO="${PH_ANNOTATE_PORT_LO:-8444}"
+PORT_HI="${PH_ANNOTATE_PORT_HI:-8450}"
+TIMEOUT="${PH_ANNOTATE_TIMEOUT_SECS:-1800}"
+MAX_FEEDBACK="${PH_ANNOTATE_MAX_FEEDBACK:-20000}"
+MAX_FILE=$((5 * 1024 * 1024))
+REPO_ROOTS="${PH_ANNOTATE_REPO_ROOTS:-$HOME/dev:$HOME/dotfiles}"
+MAX_PATCH=$((3 * 1024 * 1024))
+
+file="" pane="" result_file="" review="" dtype="uncommitted"
+usage() { awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$0"; }
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --pane)         [ $# -ge 2 ] || { usage >&2; exit 2; }; pane="$2"; shift ;;
+    --result-file)  [ $# -ge 2 ] || { usage >&2; exit 2; }; result_file="$2"; shift ;;
+    --timeout-secs) [ $# -ge 2 ] || { usage >&2; exit 2; }; TIMEOUT="$2"; shift ;;
+    --review)       [ $# -ge 2 ] || { usage >&2; exit 2; }; review="$2"; shift ;;
+    --diff-type)    [ $# -ge 2 ] || { usage >&2; exit 2; }; dtype="$2"; shift ;;
+    -h|--help)      usage; exit 0 ;;
+    -*)             echo "ph-annotate: unknown option '$1'" >&2; exit 2 ;;
+    *)              [ -z "$file" ] || { echo "ph-annotate: only one file" >&2; exit 2; }; file="$1" ;;
+  esac
+  shift
+done
+[ -n "$file" ] || [ -n "$review" ] || { usage >&2; exit 2; }
+[ -z "$file" ] || [ -z "$review" ] || { echo "ph-annotate: give a FILE or --review DIR, not both" >&2; exit 2; }
+case "$TIMEOUT" in ''|*[!0-9]*) echo "ph-annotate: --timeout-secs must be a whole number" >&2; exit 2 ;; esac
+
+die() { local code="$1"; shift; echo "ph-annotate: $*" >&2; exit "$code"; }
+
+# ---------------------------------------------------------------- 1. the file (or the repository, in review mode)
+resolve() { python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$1" 2>/dev/null; }
+# git as a READ-ONLY tool that cannot run programs: no fsmonitor, no hooks, no pager, no prompts, no optional locks
+g() { GIT_TERMINAL_PROMPT=0 GIT_OPTIONAL_LOCKS=0 git -C "$real" -c core.fsmonitor=false -c core.hooksPath=/dev/null --no-pager "$@"; }
+label=""
+if [ -n "$review" ]; then
+  case "$dtype" in
+    uncommitted) label="Uncommitted changes" ;; branch) label="This branch vs base" ;; last-commit) label="Last commit" ;;
+    *) die 2 "--diff-type must be uncommitted, branch or last-commit" ;;
+  esac
+  real=$(resolve "$review")
+  [ -n "$real" ] && [ -d "$real" ] || die 3 "not a folder: $review"
+  allowed=0; oldifs="$IFS"; IFS=:
+  for r in $REPO_ROOTS; do
+    [ -n "$r" ] || continue
+    rr=$(resolve "$r"); [ -n "$rr" ] || continue
+    case "$real" in "$rr"/*|"$rr") allowed=1 ;; esac
+  done
+  IFS="$oldifs"
+  [ "$allowed" = 1 ] || die 3 "outside the allowed repo folders ($REPO_ROOTS): $real"
+  top=$(g rev-parse --show-toplevel 2>/dev/null)
+  [ -n "$top" ] && [ "$(resolve "$top")" = "$real" ] || die 3 "not the top folder of a git working tree: $real"
+  g rev-parse -q --verify HEAD >/dev/null 2>&1 || die 3 "this repository has no commits yet"
+else
+real=$(resolve "$file")
+[ -n "$real" ] && [ -f "$real" ] || die 3 "not a file: $file"
+case "$(basename "$real" | tr '[:upper:]' '[:lower:]')" in
+  .env*|*.pem|*.key|id_rsa*|id_ed25519*|id_ecdsa*|*.p12|*.pfx) die 3 "refusing a secret-looking file name: $(basename "$real")" ;;
+esac
+case "$(basename "$real" | tr '[:upper:]' '[:lower:]')" in
+  *.md|*.markdown|*.html|*.htm|*.txt) ;;
+  *) die 3 "only .md, .markdown, .html, .htm and .txt files can be annotated" ;;
+esac
+size=$(stat -f %z "$real" 2>/dev/null || echo 0)
+[ "$size" -le "$MAX_FILE" ] || die 3 "file is larger than 5 MB"
+allowed=0
+oldifs="$IFS"; IFS=:
+for r in $ROOTS; do
+  [ -n "$r" ] || continue
+  rr=$(resolve "$r"); [ -n "$rr" ] || continue
+  case "$real" in "$rr"/*) allowed=1 ;; esac
+done
+IFS="$oldifs"
+[ "$allowed" = 1 ] || die 3 "outside the allowed folders ($ROOTS): $real"
+fi
+
+# ---------------------------------------------------------------- tailnet / port helpers
+serve_has_port() { tailscale serve status 2>/dev/null | grep -Eq "^https://[^ ]+:$1( |\$)"; }
+serve_off()      { tailscale serve --https="$1" off >/dev/null 2>&1 || true; }
+# listeners on the port that are NOT Tailscale's own network extension (that one shows up when a
+# serve mapping exists, including an orphaned one)
+foreign_listeners() { lsof -nP -iTCP:"$1" -sTCP:LISTEN 2>/dev/null | awk 'NR > 1 && $1 !~ /^IPNExten/ { n++ } END { print n + 0 }'; }
+
+PORT="" LOCK="" TMPD="" PL_PID=""
+cleanup() {
+  trap - EXIT INT TERM HUP
+  if [ -n "$PL_PID" ] && kill -0 "$PL_PID" 2>/dev/null; then
+    kill -TERM "$PL_PID" 2>/dev/null
+    for _ in 1 2 3 4 5 6; do kill -0 "$PL_PID" 2>/dev/null || break; sleep 0.5; done
+    kill -KILL "$PL_PID" 2>/dev/null
+  fi
+  [ -n "$PORT" ] && serve_has_port "$PORT" && serve_off "$PORT"
+  [ -n "$LOCK" ] && rm -rf "$LOCK"
+  [ -n "$TMPD" ] && rm -rf "$TMPD"
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM HUP
+
+acquire_port() {
+  mkdir -p "$STATE" && chmod 700 "$STATE" 2>/dev/null
+  local p lock oldpid
+  for p in $(seq "$PORT_LO" "$PORT_HI"); do
+    lock="$STATE/lock-$p"
+    if ! mkdir "$lock" 2>/dev/null; then
+      oldpid=$(cat "$lock/pid" 2>/dev/null)
+      if [ -n "$oldpid" ] && kill -0 "$oldpid" 2>/dev/null; then continue; fi   # held by a live run
+      rm -rf "$lock"; mkdir "$lock" 2>/dev/null || continue                      # stale lock: take it over
+    fi
+    echo $$ > "$lock/pid"
+    if [ "$(foreign_listeners "$p")" -gt 0 ]; then rm -rf "$lock"; continue; fi  # something else uses it
+    if serve_has_port "$p"; then serve_off "$p"; fi                                # orphan from an interrupted run
+    PORT="$p"; LOCK="$lock"; return 0
+  done
+  return 1
+}
+
+# ---------------------------------------------------------------- 2+3. port and Plannotator
+acquire_port || die 4 "all annotate slots ($PORT_LO-$PORT_HI) are busy"
+TMPD=$(mktemp -d "$STATE/run.XXXXXX") || die 5 "cannot create a work folder in $STATE"
+out="$TMPD/out.json"; err="$TMPD/err.txt"
+
+find_base() {
+  local b cand
+  b=$(g symbolic-ref -q --short refs/remotes/origin/HEAD 2>/dev/null)
+  for cand in "$b" main master origin/main origin/master; do
+    [ -n "$cand" ] && g rev-parse -q --verify "$cand" >/dev/null 2>&1 && { echo "$cand"; return 0; }
+  done
+  return 1
+}
+add_untracked() {   # new files are part of "what changed": include small, text, non-secret ones (max 40)
+  local f n=0 lower
+  g ls-files --others --exclude-standard -z 2>/dev/null | while IFS= read -r -d '' f; do
+    n=$((n + 1)); [ "$n" -le 40 ] || break
+    lower=$(printf '%s' "${f##*/}" | tr '[:upper:]' '[:lower:]')
+    case "$lower" in .env*|*.pem|*.key|id_rsa*|id_ed25519*|id_ecdsa*|*.p12|*.pfx) continue ;; esac
+    [ -f "$real/$f" ] && [ ! -L "$real/$f" ] || continue
+    [ "$(stat -f %z "$real/$f" 2>/dev/null || echo 999999999)" -le 204800 ] || continue
+    grep -Iq . "$real/$f" 2>/dev/null || continue      # binary (or empty) files are not shown
+    g diff --no-index --no-ext-diff --no-textconv --no-color -- /dev/null "$f" >> "$patch" 2>/dev/null
+  done
+}
+if [ -n "$review" ]; then
+  patch="$TMPD/review.patch"; : > "$patch"
+  case "$dtype" in
+    uncommitted) g diff --no-ext-diff --no-textconv --no-color HEAD >> "$patch" 2>/dev/null; add_untracked ;;
+    branch)
+      base=$(find_base) || die 3 "cannot tell which branch this one started from (no main, master or origin default found)"
+      mb=$(g merge-base HEAD "$base" 2>/dev/null) || die 3 "no common ancestor with $base"
+      label="This branch vs $base"
+      g diff --no-ext-diff --no-textconv --no-color "$mb" >> "$patch" 2>/dev/null; add_untracked ;;
+    last-commit)
+      if g rev-parse -q --verify HEAD~1 >/dev/null 2>&1; then g diff --no-ext-diff --no-textconv --no-color HEAD~1 HEAD >> "$patch" 2>/dev/null
+      else g show --no-ext-diff --no-textconv --no-color --format= HEAD >> "$patch" 2>/dev/null; fi ;;
+  esac
+  psize=$(stat -f %z "$patch" 2>/dev/null || echo 0)
+  [ "$psize" -gt 0 ] || die 3 "no changes to review ($label)"
+  [ "$psize" -le "$MAX_PATCH" ] || die 3 "the diff is too large for the phone ($((psize / 1024)) KB, limit $((MAX_PATCH / 1024)) KB): review it on the Mac"
+  title="$(basename "$real") · $label"
+fi
+# PLANNOTATOR_AI=disabled: the pages are reachable from the phone WITHOUT the hub's PIN, and by default they offer an "ask AI" backend
+# (a Claude SDK provider that can use tools) and review-agent jobs. A phone session only needs to read and comment.
+if [ -n "$review" ]; then
+  ( cd / && PLANNOTATOR_AI=disabled PLANNOTATOR_PORT="$PORT" NO_ANON_PING=1 exec "$PLANNOTATOR_BIN" review --patch-file "$patch" --title "$title" --tailscale --browser none --json >"$out" 2>"$err" ) &
+else
+  ( cd / && PLANNOTATOR_AI=disabled PLANNOTATOR_PORT="$PORT" NO_ANON_PING=1 exec "$PLANNOTATOR_BIN" annotate "$real" --tailscale --browser none --json >"$out" 2>"$err" ) &
+fi
+PL_PID=$!
+
+url=""
+for _ in $(seq 1 60); do
+  url=$(sed -n 's/.*session ready: \(https:[^ ]*\).*/\1/p' "$err" 2>/dev/null | head -n 1)
+  [ -n "$url" ] && break
+  kill -0 "$PL_PID" 2>/dev/null || break
+  sleep 0.5
+done
+if [ -z "$url" ]; then
+  die 5 "Plannotator did not start: $(tail -n 3 "$err" 2>/dev/null | tr '\n' ' ' | cut -c1-300)"
+fi
+case "$url" in
+  https://*:"$PORT") ;;
+  *) die 5 "Plannotator is not on the expected port $PORT (got $url); stopping it" ;;
+esac
+echo "URL $url"
+echo "PORT $PORT"
+
+# ---------------------------------------------------------------- 4. wait for the decision
+start=$(date +%s); timed_out=0
+while kill -0 "$PL_PID" 2>/dev/null; do
+  if [ $(( $(date +%s) - start )) -ge "$TIMEOUT" ]; then timed_out=1; break; fi
+  sleep 0.5
+done
+if [ "$timed_out" = 1 ]; then
+  echo "DECISION none"
+  [ -n "$result_file" ] && { umask 077; jq -n --arg url "$url" --arg target "$real" '{decision:"none", reason:"timeout", url:$url, target:$target, delivered:false}' > "$result_file"; }
+  die 6 "timed out after ${TIMEOUT}s; the session was closed"
+fi
+wait "$PL_PID" 2>/dev/null; PL_PID=""
+
+decision=$(jq -r '.decision // empty' "$out" 2>/dev/null)
+feedback=$(jq -r '.feedback // .message // empty' "$out" 2>/dev/null)
+count=$(jq -r '.annotationCount // (if .decision == "annotated" then 1 else 0 end)' "$out" 2>/dev/null)
+[ -n "$decision" ] || decision="none"
+case "$count" in ''|*[!0-9]*) count=0 ;; esac
+echo "DECISION $decision"
+
+# ---------------------------------------------------------------- 5. deliver
+delivered=false; note=""
+case "$decision" in
+  annotated|approved)
+    if [ -z "$feedback" ]; then note="nothing_to_send"
+    elif [ -z "$pane" ]; then note="no_pane_given"
+    elif [ "${#feedback}" -gt "$MAX_FEEDBACK" ]; then note="feedback_too_long"
+    elif ! tmux list-panes -a -F '#{pane_id}' 2>/dev/null | grep -qxF "$pane"; then note="pane_gone"
+    else
+      cmd=$(tmux display-message -p -t "$pane" '#{pane_current_command}' 2>/dev/null)
+      case "$cmd" in
+        zsh|bash|fish|sh|dash|ksh|tcsh|csh|-zsh|-bash|login) note="pane_is_a_shell" ;;
+        *)
+          if [ -n "$review" ]; then text="Code review feedback on ${real} (${label}):
+
+${feedback}"
+          else text="Plannotator feedback on ${real}:
+
+${feedback}"; fi
+          if tmux set-buffer -b ph-annotate-feedback -- "$text" 2>/dev/null &&
+             tmux paste-buffer -p -d -b ph-annotate-feedback -t "$pane" 2>/dev/null; then
+            delivered=true
+          else
+            note="paste_failed"
+          fi ;;
+      esac
+    fi ;;
+  *) note="no_feedback" ;;
+esac
+if [ "$delivered" = true ]; then echo "DELIVERED $pane"; else echo "NOT_DELIVERED $note"; fi
+
+if [ -n "$result_file" ]; then
+  ( umask 077
+    jq -n --arg decision "$decision" --arg feedback "$feedback" --argjson count "${count:-0}" --arg url "$url" \
+          --arg target "$real" --arg pane "$pane" --argjson delivered "$delivered" --arg note "$note" \
+          --arg kind "$([ -n "$review" ] && echo review || echo annotate)" --arg dtype "$dtype" --arg label "$label" \
+          '{decision:$decision, annotationCount:$count, feedback:$feedback, url:$url, target:$target, pane:$pane, delivered:$delivered, note:$note, kind:$kind, diff_type:$dtype, label:$label}' > "$result_file" )
+fi
+
+case "$decision" in
+  annotated|approved) if [ "$delivered" = true ] || [ "$note" = nothing_to_send ] || [ "$note" = no_pane_given ]; then exit 0; else exit 7; fi ;;
+  *) exit 0 ;;
+esac
