@@ -1,0 +1,329 @@
+#!/usr/bin/env bash
+# wm-phone: phone-sized view of your workmux agents, with a number picker to jump into one.
+#
+#   wm-phone                 list agents that need a look: WAIT first, then DONE, then WORK.
+#                            STALE agents (done for more than 24h) are folded into one footer line.
+#                            In a terminal it then asks "Go to #": type the number of an agent.
+#   wm-phone -a, --all       include the STALE agents too (shown last, dimmed)
+#   wm-phone -l, --list      only print the list, never ask (this is also what a pipe gets)
+#   wm-phone --pick          always ask, even when not on a terminal (used by tests)
+#   wm-phone --home          put everything back (run this when you are back at the desk)
+#   wm-phone --unzoom        same as --home
+#   wm-phone --icons MODE    agent icon style: text (default), unicode, logo
+#   wm-phone -h, --help
+#
+# At the "Go to #" prompt: a number jumps, r = refresh, a = show/hide STALE, q or Enter = quit.
+#
+# Jumping to an agent:
+#   1. remembers the window's desk layout (size, side-pane widths), once per window
+#   2. HIDES THE WORKMUX SIDEBAR in that agent's session. The sidebar takes ~40 of a phone's 50
+#      columns and re-lays the window out on every resize, which cancels zoom, so zoom cannot
+#      work with it on.
+#   3. selects the agent's window and pane, and ZOOMS the agent pane (hides the side shell)
+#   4. attaches (from a plain SSH shell) or switches your tmux client to that session
+#
+# `wm-phone --home` undoes exactly what wm-phone did, in this order: windows back to their desk
+# size, sidebars back on, unzoom, side-pane widths restored, window sizing handed back to tmux.
+# It only touches sessions and windows wm-phone changed, and nothing else.
+# Until you run it, those sessions have no sidebar when you look at them at the desk.
+# The phone and the desk share each session's current window, so only jump while you are away.
+#
+# Env:
+#   WM_PHONE_ICONS=text|unicode|logo   same as --icons (the flag wins)
+#   WM_PHONE_STALE_HOURS=24            how long "done" must sit before it counts as STALE
+#   WM_PHONE_COLOR=1                   force colour when stdout is not a terminal
+#   WM_PHONE_NO_SIDEBAR=1              do not hide/restore the sidebar (zoom will not survive it)
+#   WM_PHONE_STATUS_JSON=<file>        read agents from a file instead of `workmux status` (tests)
+#   WM_PHONE_NO_ATTACH=1               print what would happen instead of attaching/switching (tests)
+#   COLUMNS                            width to format for (default: terminal width, else 48)
+#
+# Icon styles: text = cl/co/oc. unicode = standard symbols (Claude ✳, Copilot ◆, OpenCode ▣).
+#   logo = the real logos from the AgentIcons font (U+E400/E402/E403): only draws where that font
+#   is installed (Ghostty here), empty boxes elsewhere.
+#
+# States (from `workmux status --all --json`): WAIT = the agent asked you something, DONE = it
+# finished its turn recently, WORK = running, STALE = done for longer than the threshold.
+#
+# Format, sized for a phone terminal:
+#    1 WAIT   4m cl review:pr-1234
+#      Review companion for PR 1234
+
+set -euo pipefail
+
+# Non-interactive SSH shells do not have Homebrew on PATH (same reason artifact-picker.sh sets it).
+export PATH="/opt/homebrew/bin:$HOME/.local/bin:$PATH"
+
+SEP=$'\x1f'   # field separator for the records jq emits (not whitespace, so empty fields survive)
+TAB=$'\t'
+state_dir="${XDG_STATE_HOME:-$HOME/.local/state}/wm-phone"
+state_file="$state_dir/state"
+# state file lines (one fact each, first writer wins):
+#   SESSION <name>                       sidebar hidden by wm-phone in this session
+#   ZOOM <window_id>                     window zoomed by wm-phone
+#   WIN <window_id> <width> <height>     the window's desk size before the phone touched it
+#   PANE <window_id> <pane_id> <width>   a non-agent, non-sidebar pane and its desk width
+
+show_all=0
+mode=auto            # auto | list | pick | home
+icons="${WM_PHONE_ICONS:-text}"
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -a|--all)  show_all=1 ;;
+    -l|--list) mode=list ;;
+    --pick)    mode=pick ;;
+    --home|--unzoom) mode=home ;;
+    --icons)   shift; icons="${1:-}" ;;
+    -h|--help) awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$0"; exit 0 ;;
+    *) echo "wm-phone: unknown option '$1' (try --help)" >&2; exit 2 ;;
+  esac
+  shift
+done
+case "$icons" in unicode|logo|text) ;; *) echo "wm-phone: --icons must be text, unicode or logo" >&2; exit 2 ;; esac
+
+stale_hours="${WM_PHONE_STALE_HOURS:-24}"
+case "$stale_hours" in ''|*[!0-9]*) echo "wm-phone: WM_PHONE_STALE_HOURS must be a whole number" >&2; exit 2 ;; esac
+stale_secs=$((stale_hours * 3600))
+
+width="${COLUMNS:-}"
+[ -n "$width" ] || width=$(tput cols 2>/dev/null || echo 48)
+[ "$width" -ge 30 ] 2>/dev/null || width=48
+
+color=0
+{ [ -t 1 ] || [ -n "${WM_PHONE_COLOR:-}" ]; } && color=1
+
+# ---------------------------------------------------------------- tmux / state helpers
+st_add() {   # append a state line once
+  mkdir -p "$state_dir" 2>/dev/null || true
+  grep -qxF -- "$1" "$state_file" 2>/dev/null || printf '%s\n' "$1" >> "$state_file"
+}
+st_each() {  # st_each KIND -> prints the rest of each line of that kind
+  [ -s "$state_file" ] || return 0
+  awk -v k="$1" '$1 == k { $1 = ""; sub(/^ /, ""); print }' "$state_file"
+}
+win_exists()  { tmux list-windows -a -F '#{window_id}' 2>/dev/null | grep -qxF "$1"; }
+pane_exists() { tmux list-panes -a -F '#{pane_id}' 2>/dev/null | grep -qxF "$1"; }
+sess_exists() { tmux has-session -t "=$1" 2>/dev/null; }
+
+# Sidebar panes of a session. Our own throwaway window is ignored.
+sidebar_panes() {
+  tmux list-panes -s -t "=$1" -F "#{window_name}${TAB}#{pane_current_command}" 2>/dev/null |
+    awk -F'\t' '$1 != "wm-phone-tmp" && $2 == "workmux"' | wc -l | tr -d ' '
+}
+# Run `workmux sidebar --session on|off` INSIDE the target session. workmux decides which session
+# it means from the pane it runs in; `tmux run-shell -t` does not provide that, a new window does.
+sidebar_cmd() {
+  local bin; bin=$(command -v workmux) || return 1
+  tmux new-window -d -t "=$1:" -n wm-phone-tmp "$bin sidebar --session $2"
+}
+wait_sidebar() {   # wait_sidebar <session> gone|back  (up to ~5s)
+  local i n
+  for i in $(seq 1 50); do
+    n=$(sidebar_panes "$1")
+    if [ "$2" = gone ] && [ "$n" -eq 0 ]; then return 0; fi
+    if [ "$2" = back ] && [ "$n" -gt 0 ]; then return 0; fi
+    sleep 0.1
+  done
+  return 1
+}
+
+record_layout() {   # record_layout <window_id> <agent_pane>: the first jump to a window wins
+  local wid="$1" agent="$2" p w cmd size
+  grep -q "^WIN $wid " "$state_file" 2>/dev/null && return 0
+  size=$(tmux display-message -p -t "$wid" '#{window_width} #{window_height}')
+  st_add "WIN $wid $size"
+  tmux list-panes -t "$wid" -F "#{pane_id} #{pane_width} #{pane_current_command}" |
+    while read -r p w cmd; do
+      [ "$p" = "$agent" ] && continue
+      [ "$cmd" = workmux ] && continue
+      st_add "PANE $wid $p $w"
+    done
+}
+
+hide_sidebar() {    # hide_sidebar <session>
+  [ -z "${WM_PHONE_NO_SIDEBAR:-}" ] || return 0
+  [ "$(sidebar_panes "$1")" -gt 0 ] || return 0      # none showing (you turned it off): leave it alone
+  st_add "SESSION $1"
+  sidebar_cmd "$1" off || return 0
+  wait_sidebar "$1" gone || echo "wm-phone: the sidebar in '$1' did not hide; zoom may not stick." >&2
+}
+
+# ---------------------------------------------------------------- --home
+if [ "$mode" = home ]; then
+  if [ ! -s "$state_file" ]; then echo "Nothing to restore."; exit 0; fi
+  nw=0; ns=0; nz=0; np=0
+  # 1. each window back to its desk size, so the layouts below are computed at desk size
+  while read -r wid w h; do
+    if win_exists "$wid"; then tmux resize-window -t "$wid" -x "$w" -y "$h" 2>/dev/null && nw=$((nw + 1)) || true; fi
+  done < <(st_each WIN)
+  # 2. sidebars back on
+  while read -r sess; do
+    [ -n "$sess" ] || continue
+    if sess_exists "$sess"; then
+      sidebar_cmd "$sess" on && wait_sidebar "$sess" back && ns=$((ns + 1)) || echo "wm-phone: the sidebar in '$sess' did not come back (try: prefix B)." >&2
+    fi
+  done < <(st_each SESSION)
+  # 3. unzoom the windows we zoomed (turning the sidebar on may already have done it)
+  while read -r wid; do
+    [ -n "$wid" ] && win_exists "$wid" || continue
+    if [ "$(tmux display-message -p -t "$wid" '#{window_zoomed_flag}')" = 1 ]; then tmux resize-pane -Z -t "$wid" && nz=$((nz + 1)) || true; fi
+  done < <(st_each ZOOM)
+  # 4. side panes back to their desk widths (only in windows that are not zoomed)
+  while read -r wid p w; do
+    [ -n "$p" ] && pane_exists "$p" || continue
+    [ "$(tmux display-message -p -t "$wid" '#{window_zoomed_flag}')" = 0 ] || continue
+    tmux resize-pane -t "$p" -x "$w" 2>/dev/null && np=$((np + 1)) || true
+  done < <(st_each PANE)
+  # 5. hand window sizing back to tmux (resize-window made it manual)
+  while read -r wid w h; do
+    if win_exists "$wid"; then tmux set-option -wu -t "$wid" window-size 2>/dev/null || true; fi
+  done < <(st_each WIN)
+  rm -f "$state_file"
+  echo "Home: $ns sidebar(s) back on, $nz window(s) unzoomed, $np pane width(s) restored, $nw window size(s) reset."
+  exit 0
+fi
+
+# ---------------------------------------------------------------- data
+fetch_json() {
+  if [ -n "${WM_PHONE_STATUS_JSON:-}" ]; then cat "$WM_PHONE_STATUS_JSON"
+  else workmux status --all --json 2>/dev/null; fi
+}
+
+# Emits one record per line, fields joined by $SEP:  kind, pane_id, line1, line2
+#   A = an agent row, F = footer line, M = message.  Formatting happens in jq so widths count
+#   characters, not bytes.
+records() {
+  local json
+  json=$(fetch_json) || { echo "wm-phone: 'workmux status' failed. Is tmux running?" >&2; return 1; }
+  jq -r --argjson w "$width" --argjson all "$show_all" --argjson color "$color" \
+        --argjson stale "$stale_secs" --argjson stale_h "$stale_hours" --arg icons "$icons" '
+    def age: if . < 90 then "\(.)s"
+             elif . < 5400 then "\((. / 60) | floor)m"
+             elif . < 129600 then "\((. / 3600) | floor)h"
+             else "\((. / 86400) | floor)d" end;
+    def ljust(n): . + ((n - length) as $k | if $k > 0 then " " * $k else "" end);
+    def rjust(n): ((n - length) as $k | if $k > 0 then " " * $k else "" end) + .;
+    # workmux prefixes window names with a Nerd Font icon (private-use code point); drop it.
+    def clean: gsub("[\\x{E000}-\\x{F8FF}\\x{F0000}-\\x{FFFFD}\\x{100000}-\\x{10FFFD}]"; "")
+               | gsub("[\\t\\r\\n\\x1f]"; " ")
+               | gsub("^\\s+|\\s+$"; "");
+    def icon:
+      if $icons == "text" then ({"claude":"cl","copilot":"co","opencode":"oc"}[.] // .[0:2])
+      elif $icons == "logo" then ({"claude":"","copilot":"","opencode":""}[.] // "•")
+      else ({"claude":"✳","copilot":"◆","opencode":"▣"}[.] // "•") end;
+    def state: if .status == "done" and .elapsed_secs > $stale then "stale" else .status end;
+    def tag: ({"waiting":"WAIT","done":"DONE","working":"WORK","stale":"STALE"}[.] // "?");
+    def rank: ({"waiting":0,"done":1,"working":2,"stale":3}[.] // 2);
+    def paint(c): if $color == 1 then "\u001b[\(c)m\(.)\u001b[0m" else . end;
+    def hue: if . == "waiting" then "1;33" elif . == "done" then "32" else "34" end;
+
+    ((.agents // []) | map(. + {st: state})) as $agents
+    | ($agents | map(select(.st == "stale")) | length) as $old
+    | ($agents
+       | map(select($all == 1 or .st != "stale"))
+       | sort_by([(.st | rank), (if .st == "waiting" then -.elapsed_secs else .elapsed_secs end)])) as $shown
+    | if ($shown | length) == 0 and $old == 0 then "M\u001f-\u001fNo agents running.\u001f"
+      else
+        ( $shown | to_entries[]
+          | .key as $i | .value as $a
+          | (($i + 1) | tostring | rjust(2)) as $n
+          | ($a.st | tag | ljust(5)) as $t
+          | ($a.elapsed_secs | age | rjust(3)) as $e
+          | (($a.agent_kind // "") | icon) as $ic
+          | (($n + " " + $t + " " + $e + " " + $ic + " ") | length) as $used
+          | ((($a.session // "") + ":" + ($a.window_name // "" | clean)) | clean | .[0:($w - $used)]) as $where
+          | ($a.title // "" | clean | sub("^[^A-Za-z0-9]+"; "") | sub(" - GitHub Copilot$"; "")) as $title
+          | (if $a.st == "stale"
+             then ($n + " " + $t + " " + $e + " " + $ic + " " + $where | paint("2"))
+             else ($n + " " + ($t | paint($a.st | hue)) + " " + $e + " " + $ic + " " + $where) end) as $l1
+          | ("   " + $title | .[0:$w] | paint("2")) as $l2
+          | "A\u001f\($a.pane_id // "-")\u001f\($l1)\u001f\($l2)"
+        ),
+        (if $old > 0 and $all == 0
+         then "F\u001f-\u001f\("+\($old) STALE, done over \($stale_h)h (wm-phone -a)" | paint("2"))\u001f"
+         else empty end)
+      end
+  ' <<<"$json"
+}
+
+PANES=()
+OUT=""
+load() {
+  PANES=(); OUT=""
+  local kind pane l1 l2 recs
+  recs=$(records) || return 1
+  while IFS="$SEP" read -r kind pane l1 l2; do
+    case "$kind" in
+      A) PANES+=("$pane"); OUT+="$l1"$'\n'"$l2"$'\n' ;;
+      F|M) OUT+="$l1"$'\n' ;;
+    esac
+  done <<<"$recs"
+}
+
+# ---------------------------------------------------------------- jump
+jump() {
+  local pane="$1" sess wid zoomed panes
+  # `tmux display-message -t <missing pane>` can still exit 0, so check the pane list instead.
+  if ! pane_exists "$pane"; then
+    echo "That agent's pane ($pane) is gone. Press r to refresh." >&2; return 1
+  fi
+  sess=$(tmux display-message -p -t "$pane" '#{session_name}')
+  wid=$(tmux display-message -p -t "$pane" '#{window_id}')
+
+  record_layout "$wid" "$pane"      # BEFORE anything changes: this is the desk layout
+  hide_sidebar "$sess"              # BEFORE zoom: the sidebar re-layout would cancel it
+
+  zoomed=$(tmux display-message -p -t "$pane" '#{window_zoomed_flag}')
+  panes=$(tmux display-message -p -t "$pane" '#{window_panes}')
+  tmux select-window -t "$wid"
+  tmux select-pane -t "$pane"
+  # Zoom only when there is something to hide, and only record windows WE zoomed.
+  if [ "$zoomed" = 0 ] && [ "$panes" -gt 1 ]; then
+    tmux resize-pane -Z -t "$pane"
+    st_add "ZOOM $wid"
+  fi
+
+  if [ -n "${WM_PHONE_NO_ATTACH:-}" ]; then
+    echo "wm-phone: would $([ -n "${TMUX:-}" ] && echo "switch-client to" || echo "attach to") session '$sess', window $wid, pane $pane"
+  elif [ -n "${TMUX:-}" ]; then
+    tmux switch-client -t "=$sess"
+  else
+    exec tmux attach-session -t "=$sess"
+  fi
+}
+
+# ---------------------------------------------------------------- main
+interactive=0
+case "$mode" in
+  pick) interactive=1 ;;
+  auto) if [ -t 0 ] && [ -t 1 ]; then interactive=1; fi ;;
+esac
+
+if [ "$interactive" = 0 ]; then
+  load || exit 1
+  printf '%s' "$OUT"
+  exit 0
+fi
+
+first=1
+while true; do
+  load || exit 1
+  if [ "$first" = 0 ] && [ -t 1 ]; then printf '\033[2J\033[H'; fi
+  first=0
+  printf '%s' "$OUT"
+  [ "${#PANES[@]}" -gt 0 ] || exit 0
+  printf 'Go to # (r refresh, a all/fewer, q quit): '
+  read -r ans || { echo; exit 0; }
+  case "$ans" in
+    ""|q|Q) exit 0 ;;
+    r|R)    continue ;;
+    a|A)    show_all=$((1 - show_all)); continue ;;
+    *[!0-9]*) echo "Type a number from the list." >&2; first=1 ;;
+    *)
+      if [ "$ans" -ge 1 ] && [ "$ans" -le "${#PANES[@]}" ]; then
+        jump "${PANES[$((ans - 1))]}" && exit 0
+      else
+        echo "No agent number $ans." >&2
+      fi
+      first=1 ;;
+  esac
+done

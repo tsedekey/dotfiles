@@ -1,0 +1,60 @@
+
+[38;5;174m ▐[48;5;16m▛███▛█[39m[49m   [1mClaude Code[0m [38;5;246mv2.1.325
+[38;5;174m▝▜[48;5;16m█████[49m█▀[39m  [38;5;246mSonnet 5.5 with xhigh effort · Claude Pro
+[38;5;174m ▝▝   ▝▝ [39m  [38;5;246m~/.local/share/general/hub-dialog-test/dlg-claude-personal
+
+
+[48;5;237m❯ [38;5;231mUse the AskUserQuestion tool to ask me to pick one of three colours: red, green or blue. After I answer, reply with just the [39m    
+  [38;5;231mcolour and stop.[39m                                                                                                                 
+
+[38;5;246m[49m⏺ [39mUser answered Claude's questions:
+[38;5;246m  ⎿  · Which colour do you pick? → purple
+
+[38;5;231m⏺[39m Purple
+        
+[38;5;246m✻[39m [38;5;246mSautéed for 3s · done 22:55
+[39m          
+[38;5;246m[48;5;237m❯ [38;5;231mRun this exact shell command and show me its output: echo hello-from-dialog-test[39m                                                 
+[49m         
+  [38;5;246mRan [1m1[0m[38;5;246m shell command 
+
+[38;5;231m⏺[39m Output:
+                    
+  [38;5;153mhello-from-dialog-test
+
+[38;5;246m✻[39m [38;5;246mCrunched for 3s · done 22:56
+
+[48;5;237m❯ [38;5;231mCreate a file named permtest.txt in the current folder containing the single word hello, using your file-writing tool.[39m           
+
+[38;5;211m[49m⏺[39m [1mWrite[0m(]8;id=f2of5k;file:///Users/eddie.tsedeke/.local/share/general/hub-dialog-test/dlg-claude-personal/permtest.txt\permtest.txt]8;;\)
+[38;5;246m  ⎿  User rejected write to [1m]8;id=f2of5k;file:///Users/eddie.tsedeke/.local/share/general/hub-dialog-test/dlg-claude-personal/permtest.txt\permtest.txt]8;;\
+[0m     [2m[38;5;231m 1 hello[0m                                                                                                                      
+            
+[38;5;246m✻[39m [38;5;246mCooked for 1s · done 22:57
+
+[39m         
+
+                                    
+         
+                                                                                                                     
+        
+
+                             
+
+
+
+
+
+
+
+
+
+
+
+
+                                                                                                                                 
+[38;5;244m───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+[39m❯ 
+[38;5;244m───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+[39m  [38;5;111m~/.local/share/general/hub-dialog-test/dlg-claude-personal[38;5;246m [38;5;244m❯ Sonnet 5.5[38;5;246m [38;5;244m[ctx: 4%][38;5;246m [38;5;203m[RATE LIMITED: 5h:11% 7d:29%]
+[39m  [38;5;246m⏸ manual mode on[39m                                   
