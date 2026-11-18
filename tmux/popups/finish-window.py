@@ -61,9 +61,9 @@ def window_info(wid):
     session, name, nwin, here = tmux("display-message", "-p", "-t", wid,
                                      "#{session_name}\t#{window_name}\t#{session_windows}\t#{?@launcher_here,1,0}").split("\t")
     panes = []
-    for line in tmux("list-panes", "-t", wid, "-F", "#{pane_id}\t#{pane_current_command}\t#{pane_current_path}").splitlines():
-        pid, cmd, path = line.split("\t")
-        panes.append({"id": pid, "cmd": cmd, "path": path})
+    for line in tmux("list-panes", "-t", wid, "-F", "#{pane_id}\t#{pane_current_command}\t#{pane_current_path}\t#{pane_pid}").splitlines():
+        pid, cmd, path, ppid = line.split("\t")
+        panes.append({"id": pid, "cmd": cmd, "path": path, "pid": int(ppid)})
     return {"id": wid, "session": session, "name": name, "windows": int(nwin), "panes": panes, "here": here == "1"}
 
 
@@ -113,15 +113,65 @@ def git(wt, *args):
     return run(["git", *args], cwd=wt["path"])
 
 
-def worktree_state(wt):
-    """-> (merged_and_clean, [reasons it is not], [facts to show])"""
+def raw(cmd, cwd=None, timeout=20):
+    """Like run() but the output is NOT stripped (git status -z needs its leading spaces)."""
+    try:
+        r = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return 127, "", str(e)
+    return r.returncode, r.stdout, r.stderr.strip()
+
+
+def classify_dirt(path):
+    """-> (tracked changes, untracked non-symlinks, untracked symlinks as (path, target)), or None if git fails.
+    Also used by close-case.py, so the popup and the case check agree on what is dirt.
+
+    An untracked symlink is NOT dirt: removing a worktree removes only the link, never what it points to (checked
+    2026-11-18 with `git worktree remove --force` and `workmux remove -f`). DagRunner seeds `node_modules` symlinks
+    into its worktree at launch; the repo's `node_modules/` ignore rule has a trailing slash and so does not match a
+    symlink, which is why one of them shows up as untracked."""
+    rc, out, _ = raw(["git", "status", "--porcelain", "-z"], cwd=path)
+    if rc:
+        return None
+    parts = [e for e in out.split("\0") if e]
+    tracked, others, links, i = [], [], [], 0
+    while i < len(parts):
+        xy, rel = parts[i][:2], parts[i][3:]
+        if xy == "??":
+            full = os.path.join(path, rel.rstrip("/"))
+            if os.path.islink(full):
+                links.append((rel, os.readlink(full)))
+            else:
+                others.append(rel)
+        elif xy != "!!":
+            tracked.append(f"{xy.strip() or '?'} {rel}")
+        if xy[:1] in ("R", "C"):
+            i += 1  # a rename or copy carries the old path as the next entry
+        i += 1
+    return tracked, others, links
+
+
+def sibling_windows(wt, wid):
+    """Names of the OTHER tmux windows with a pane inside this worktree (None if tmux cannot say): removing the
+    worktree would pull the folder out from under them."""
+    rc, out, _ = run(["tmux", "list-panes", "-a", "-F", "#{window_id}\t#{window_name}\t#{pane_current_path}"])
+    if rc:
+        return None
+    root = os.path.realpath(wt["path"])
+    names = {}
+    for line in out.splitlines():
+        w, name, path = line.split("\t")
+        rp = os.path.realpath(path)
+        if w != wid and (rp == root or rp.startswith(root + os.sep)):
+            names[w] = re.sub(r"^[^A-Za-z0-9]+", "", name)
+    return list(names.values())
+
+
+def merge_state(wt):
+    """-> (merged, [reasons it is not], [facts to show]). Also used by close-case.py.
+
+    "merged" = the PR is MERGED and HEAD is that PR's head, or HEAD is already in origin's base branch."""
     facts, reasons = [], []
-    rc, out, err = git(wt, "status", "--porcelain")
-    if rc:  # fail closed: if git cannot say the tree is clean, it is not
-        reasons.append(f"cannot read git status ({err or 'git failed'})")
-    dirty = [l for l in out.splitlines() if l]
-    if dirty:
-        reasons.append(f"{len(dirty)} uncommitted or untracked file(s)")
     head = git(wt, "rev-parse", "HEAD")[1]
     branch = wt["branch"]
     base = git(wt, "symbolic-ref", "--short", "refs/remotes/origin/HEAD")[1] or "origin/main"
@@ -149,7 +199,26 @@ def worktree_state(wt):
             reasons.append(f"PR #{pr['number']} is {pr['state'].lower()}, not merged")
         else:
             reasons.append(f"no merged PR, and {ahead or '?'} commit(s) are not in {base}")
-    return (merged and not dirty), reasons, facts
+    return merged, reasons, facts
+
+
+def worktree_state(wt):
+    """-> (merged_and_clean, [reasons it is not], [facts to show]). Untracked symlinks do not count as dirt."""
+    reasons, link_facts = [], []
+    dirt = classify_dirt(wt["path"])
+    if dirt is None:  # fail closed: if git cannot say the tree is clean, it is not
+        reasons.append("cannot read git status (git failed)")
+        dirty = True
+    else:
+        tracked, others, links = dirt
+        dirty = bool(tracked or others)
+        if dirty:
+            reasons.append(f"{len(tracked) + len(others)} uncommitted or untracked file(s)")
+        link_facts = [f"untracked symlink: {p} (only the link goes with the worktree)" for p, _ in links[:3]]
+        if len(links) > 3:
+            link_facts.append(f"... and {len(links) - 3} more untracked symlinks")
+    merged, merge_reasons, facts = merge_state(wt)
+    return (merged and not dirty), reasons + merge_reasons, facts + link_facts
 
 
 def getkey():
@@ -167,41 +236,118 @@ def getkey():
         os.close(fd)
 
 
+def case_helpers():
+    """close-case.py's discovery helpers, or None. The popup must keep working without them (it then prints the
+    plainer lines), so any failure here is swallowed."""
+    try:
+        import importlib.util
+        sys.dont_write_bytecode = True
+        spec = importlib.util.spec_from_file_location("close_case", os.path.join(os.path.dirname(os.path.abspath(__file__)), "close-case.py"))
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+    except Exception:
+        return None
+
+
+def running_line(cc, procs, pane):
+    """What a pane that is neither a shell nor a tracked agent is running."""
+    plain = f"! still running here: {pane['cmd']}"
+    if not cc:
+        return plain
+    try:
+        kind, text = cc.describe_process(procs, pane)
+    except Exception:  # the popup must never crash on a helper
+        return plain
+    return f"! {text} is running here" if kind == "dagrun-ui" else f"! still running here: {text}"
+
+
+def case_lines(cc, win, wt, status):
+    """If this window drives a DagRunner case, say so and name the windows that belong to it; [] otherwise."""
+    if not cc:
+        return []
+    try:
+        state = cc.resolve_run(wt["path"])
+        fam = cc.find_family(state, cc.inventory(), status)
+        if not fam["driver"] or fam["driver"]["id"] != win["id"]:
+            return []
+        others = ([w["bare"] for w in fam["here"]] + ([fam["plan"]["bare"]] if fam["plan"] else [])
+                  + [w["bare"] for w in fam["in_worktree"][1:]])
+        rid, st = state["runId"], state.get("status")
+        lines = [f"this window drives case {fam['key']} (run {rid}, {st})" if fam["key"] else f"this window drives run {rid} ({st})"]
+        if others:
+            lines.append(f"{len(others)} more window{'' if len(others) == 1 else 's'} belong to it: {', '.join(others)}")
+            lines.append("closing only this one leaves them open (close the whole case with close-case.py execute; try it with --dry-run)")
+        return lines
+    except Exception:  # the popup must never crash on a helper
+        return []
+
+
+def named_dirt(wt, reasons):
+    """Replace the vague "N uncommitted or untracked file(s)" with the names (three per kind at most). Falls back to
+    the original reasons when git gives nothing to name."""
+    dirt = classify_dirt(wt["path"])
+    if not dirt:
+        return reasons
+    tracked, others, _links = dirt
+    named = []
+    for items, fmt in ((tracked, "uncommitted change: {}"), (others, "untracked file: {}")):
+        named += [fmt.format(i) for i in items[:3]]
+        if len(items) > 3:
+            named.append(f"... and {len(items) - 3} more")
+    if not named:
+        return reasons
+    return named + [r for r in reasons if "uncommitted or untracked file" not in r]
+
+
 def plan(win, status):
-    """-> (title, lines to show, command argv + cwd, confirm label)"""
-    agents = [(p, status.get(p["id"])) for p in win["panes"] if p["id"] in status]
-    busy = [p for p in win["panes"] if p["cmd"] not in SHELLS and p["id"] not in status]
+    """-> (title, lines to show, command argv + cwd)
+
+    The popup shows only what can change the answer: something still running in the window, and for a
+    worktree what keeps it from being deleted. An idle agent, pane ids and the tmux command are not shown
+    (--dry-run still prints the command)."""
     lines = []
-    for p, st in agents:
-        lines.append(f"agent   pane {p['id']} ({p['cmd']})  status: {st}" + ("   <-- still working" if st == "working" else ""))
-    for p in busy:
-        lines.append(f"running pane {p['id']}: {p['cmd']}")
+    cc = case_helpers()
+    try:
+        procs = cc.process_table() if cc else {}
+    except Exception:
+        procs = {}
+    for p in win["panes"]:
+        if status.get(p["id"]) == "working":
+            lines.append("! an agent here is still working; closing stops it")
+        elif status.get(p["id"]) == "waiting":  # workmux: "agent needs user input". Copilot never reports this state.
+            lines.append("! an agent here is waiting for your answer; closing drops the question")
+        elif p["id"] not in status and p["cmd"] not in SHELLS:
+            lines.append(running_line(cc, procs, p))
     if win["windows"] <= 1:
         raise Fail(f"'{win['name']}' is the only window in session '{win['session']}'; closing it would end the session.")
+    name = f"{win['session']}:{win['name']}"
     if win["here"]:  # a launcher `here` window (triage, babysit): it sits in a worktree that another window owns
-        lines.append("side window on a worktree (started by the launcher's `here` mode): only this window closes;")
-        lines.append("the worktree, its branch and its other windows are not touched")
-        return (f"Finish {win['session']}:{win['name']}", lines,
-                (["tmux", "kill-window", "-t", win["id"]], None), "close the window (tmux kill-window)")
+        lines.append("the worktree it sits in stays")
+        return (f"Close {name}", lines, (["tmux", "kill-window", "-t", win["id"]], None))
     wt = find_worktree(win)
     if wt is None:
-        lines.append("plain window: nothing on disk besides the agent's transcript")
-        return (f"Finish {win['session']}:{win['name']}", lines,
-                (["tmux", "kill-window", "-t", win["id"]], None), "close the window (tmux kill-window)")
+        return (f"Close {name}", lines, (["tmux", "kill-window", "-t", win["id"]], None))
     ok, reasons, facts = worktree_state(wt)
-    lines.append(f"worktree '{wt['handle']}'  branch {wt['branch']}")
-    lines += [f"  {f}" for f in facts]
+    lines += case_lines(cc, win, wt, status)
+    lines += facts
+    reasons = named_dirt(wt, reasons)
+    siblings = sibling_windows(wt, win["id"])  # never delete a folder another window still sits in
+    if siblings is None:
+        ok = False
+        reasons.insert(0, "cannot tell which other windows sit in this worktree")
+    elif siblings:
+        ok = False
+        reasons.insert(0, f"{len(siblings)} other window{'' if len(siblings) == 1 else 's'} still sit in it: {', '.join(siblings)}")
     cwd = wt["project_path"]
     if ok:
-        lines.append("merged and clean: safe to delete")
-        return (f"Finish {win['session']}:{win['name']}", lines,
-                (["workmux", "remove", "-f", wt["handle"]], cwd),
-                f"DELETE worktree + branch + window (workmux remove -f {wt['handle']})")
-    lines.append("NOT finished, so nothing is deleted:")
-    lines += [f"  - {r}" for r in reasons]
-    return (f"Park {win['session']}:{win['name']}", lines,
-            (["workmux", "close", wt["handle"]], cwd),
-            f"close the window only; worktree and branch stay (workmux close {wt['handle']})")
+        lines.append("nothing uncommitted")
+        return (f"Delete {name}  (worktree, branch and window)", lines,
+                (["workmux", "remove", "-f", wt["handle"]], cwd))
+    lines += [f"not deleted: {r}" for r in reasons]
+    lines.append(f"reopen later: workmux open {wt['handle']}")
+    return (f"Close {name}  (worktree and branch stay)", lines,
+            (["workmux", "close", wt["handle"]], cwd))
 
 
 def main():
@@ -219,11 +365,10 @@ def main():
             wid = tmux("display-message", "-p", *(["-t", pane] if pane else []), "#{window_id}")
         print("\n  checking the window, git and the PR ...", flush=True)
         win = window_info(wid)
-        title, lines, (argv, cwd), label = plan(win, agent_status())
+        title, lines, (argv, cwd) = plan(win, agent_status())
         print(f"\n  {title}\n  " + "-" * len(title))
         for l in lines:
             print(f"  {l}")
-        print(f"\n  Action: {label}")
         if args.dry_run:
             print(f"  (dry run: {shlex.join(argv)}" + (f" in {cwd}" if cwd else "") + ")")
             return
