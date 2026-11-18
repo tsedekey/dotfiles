@@ -65,7 +65,7 @@
 #             incident                      INC-8745 | the incident.io URL. A SUPPORT-nnnnn Jira key is refused.
 #             cve                           CVE-2026-47848 (any case)
 #           A workflow with a `key` has no default `case`. Workflows without one (medic, release, daily,
-#           general) take the `case` text as typed.
+#           general) take the `case` text as typed. The `pick` workflows have no case at all (they take no argument).
 #   ask     fields the plain Enter flow asks for: case, repo. (The Tab flow always asks for everything.)
 #   worktree  false (default)  a plain tmux window; the agent is typed into its shell. No git needed.
 #             true             first creates a worktree: `workmux add <branch> -a <agent> --parent-session
@@ -122,6 +122,14 @@ workflows:
     repo: ~/dev/camunda/camunda
     files: ~/.local/share/camunda/dagrunner
 
+  pick bug:                            # read-only: ranks the next viable bug on the Core Features board (project 173); a pick goes on to `change`
+    agent: claude
+    skill: bug-picker
+    files: ~/.local/share/camunda/bug-picker    # holds picks.md, the skill's only write; no case, so no folder per run
+    extra_dirs: [~/dev/camunda/camunda]         # the skill sizes its top candidates against the local checkout, read-only
+    window: pick-bug                   # fixed name, so reuse can find it (session `pick` = first word of the workflow)
+    reuse: true                        # launching again goes back to the open pick-bug window; close it (prefix + F) once picked
+
   epic:                                # Claude, not Copilot: epic-companion needs Slack and Glean
     agent: claude
     model: claude-sonnet-5-5           # Claude ids are hyphenated (Copilot's are claude-sonnet-5.5)
@@ -140,6 +148,14 @@ workflows:
     case_label: PR number
     ask: [case]
     extra_dirs: [~/dev/camunda/camunda]
+
+  pick pr:                             # read-only: Tier 1 (asked of Eddie) + one Tier 2 pick; a pick goes on to `review`
+    agent: claude                      # Claude, not Copilot: the Copilot port of pr-picker has no Slack, so bot-only asks would be missed
+    skill: pr-picker
+    files: ~/.local/share/camunda/pr-picker     # holds picks.md, the skill's only write; no case, so no folder per run
+    extra_dirs: [~/.local/share/camunda/review-companion]   # learning-ledger.md, read-only here
+    window: pick-pr
+    reuse: true                        # as pick bug: close the window (prefix + F) once picked
 
   triage:                              # review comments on the PR of the worktree you launch it from
     session: change                    # beside the plan and the driver of the same change
