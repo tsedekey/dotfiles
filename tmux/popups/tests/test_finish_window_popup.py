@@ -214,6 +214,30 @@ class PlanGate(unittest.TestCase):
         fw.sibling_windows = lambda wt, wid: []
         self.assertEqual(fw.plan(self.win, {})[2][0][:2], ["workmux", "close"])
 
+    def stable_worktree(self, branch):
+        fw.find_worktree = lambda win: {"handle": "stable-optimize-8-6", "branch": branch, "path": "/nonexistent-w", "project_path": "/p"}
+        fw.sibling_windows = lambda wt, wid: []  # merged, clean and alone: everything else says "delete"
+
+    def test_a_stable_branch_is_never_deleted_even_when_merged_clean_and_alone(self):
+        for branch in ("stable/optimize-8.6", "stable/optimize-8.7", "stable/8.9"):
+            self.stable_worktree(branch)
+            title, lines, (argv, cwd) = fw.plan(self.win, {})
+            self.assertTrue(title.startswith("Close"), branch)
+            self.assertEqual(argv[:2], ["workmux", "close"], branch)
+            self.assertIn(f"not deleted: {branch} is a stable branch: it is never deleted from here", lines)
+            self.assertIn("reopen later: workmux open stable-optimize-8-6", lines)
+
+    def test_a_release_branch_is_still_deleted_when_merged_clean_and_alone(self):  # release/* may go once the release is done
+        self.stable_worktree("release/optimize-8.6.30")
+        title, lines, (argv, cwd) = fw.plan(self.win, {})
+        self.assertTrue(title.startswith("Delete"))
+        self.assertEqual(argv[:3], ["workmux", "remove", "-f"])
+
+    def test_the_guard_does_not_match_lookalikes(self):
+        for branch in ("feature/stable/x-ish", "unstable/x", "stable", "stable/", "backport-1-to-stable/8.8"):
+            self.stable_worktree(branch)
+            self.assertEqual(fw.plan(self.win, {})[2][0][:3], ["workmux", "remove", "-f"], branch)
+
 
 class RunningLine(unittest.TestCase):
     pane = {"id": "%1", "cmd": "node", "path": "/x", "pid": 1}

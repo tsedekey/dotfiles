@@ -64,7 +64,9 @@
 #                                           repo-65755 (folder dmn-scala-391).
 #             incident                      INC-8745 | the incident.io URL. A SUPPORT-nnnnn Jira key is refused.
 #             cve                           CVE-2026-47848 (any case)
-#           A workflow with a `key` has no default `case`. Workflows without one (medic, release, daily,
+#             optimize-release              8.6.30 | v8.6.30 | 8.6.30-optimize (the release tag). The full patch version: it
+#                                           names the folder, the window and the skill's argument, and (with `branch`) the branch.
+#           A workflow with a `key` has no default `case`. Workflows without one (medic, daily,
 #           general) take the `case` text as typed. The `pick` workflows have no case at all (they take no argument).
 #   ask     fields the plain Enter flow asks for: case, repo. (The Tab flow always asks for everything.)
 #   worktree  false (default)  a plain tmux window; the agent is typed into its shell. No git needed.
@@ -87,7 +89,17 @@
 #   extra_dirs  more folders the agent may use (--add-dir), e.g. the code checkout for a workflow that
 #               starts in its case folder. Not passed for worktrees (workmux builds that command).
 #   session   tmux session; default = the first word of the workflow name.
-#   window    window name; empty = "<last word of the workflow>-<case>", or -<HHMM> without a case.
+#   branch  a worktree workflow that works ON an existing branch of origin, derived from the key instead of typed. Needs
+#           `worktree: true` and `key: optimize-release`; `{line}` is the release line (8.6.30 -> 8.6), so
+#           `stable/optimize-{line}` gives stable/optimize-8.6. Before `workmux add` the launcher fetches the branch, creates the
+#           local one from origin when it is missing and fast-forwards it when it is behind (workmux would create a missing
+#           branch FROM MAIN: `base_branch: auto`), and refuses when origin has no such branch or the local one diverged.
+#           It warns when origin's optimize/pom.xml names another next version than the typed one. Launching the same release
+#           again switches to its open window; with the window closed it reopens the worktree (`workmux open <handle> -p`); another release
+#           on a line whose worktree is open is refused (a branch lives in one worktree). The Tab flow lets you type another
+#           branch (it must exist on origin). prefix + F only closes such a window: finish-window never deletes `stable/*`.
+#   window    window name; empty = "<last word of the workflow>-<case>", or -<HHMM> without a case. `{case}` = the case key
+#             (release-{case} -> release-8.6.30), also for a worktree window.
 #   hidden    true = not in the popup; only reachable by name from the CLI (another agent starts it:
 #             launcher.py dagrunner --branch X --prompt "/dagrunner-companion <plan>").
 #
@@ -209,14 +221,17 @@ workflows:
     case_label: shift start date
     ask: [case]
 
-  release:                             # one folder per release duty (about 4 weeks), named by its start date
+  release:                             # one Optimize patch release (8.6.30): its own worktree on stable/optimize-8.6, its own folder
     agent: claude
     skill: release-companion
-    files: ~/.local/share/camunda/release-companion
-    case: "{latest:28}"                # resume the duty started in the last 28 days, else today; Tab lists duties
-    case_label: duty start date
-    ask: [case]
-    extra_dirs: [~/dev/camunda/camunda]    # (guess) the skill's steps run git in the code checkout
+    worktree: true                     # the agent starts in a worktree on the stable branch; the skill makes its own off release/optimize-X.Y.Z
+    repo: ~/dev/camunda/camunda
+    branch: stable/optimize-{line}     # derived from the version: 8.6.30 -> stable/optimize-8.6 (see `branch` above)
+    files: ~/.local/share/camunda/release-companion    # <8.6.30>/: notes, drafts and evidence of that release
+    key: optimize-release
+    case_label: release version
+    window: release-{case}             # release-8.6.30
+    ask: [case]                        # 8.6 and 8.7 may run side by side: two launches, two worktrees, two windows
 
   daily:                               # one window and one folder per day: launching again goes back to it
     agent: claude

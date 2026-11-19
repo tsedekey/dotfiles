@@ -13,6 +13,8 @@ Picks the right close for what the window holds, shows it, and asks before doing
                     "merged" = the PR is MERGED and HEAD is that PR's head (or already in origin's
                     base branch). Uncommitted/untracked files, an open or missing PR, or newer local
                     commits all mean "keep". Unmerged work is never deleted from here.
+                    A `stable/*` branch (a release's worktree) is never deleted either, merged or not: the window
+                    closes and the worktree and branch stay. `release/*` and other branches follow the rules above.
 
   Refuses to close the last window of a session (that would end the session).
 
@@ -33,6 +35,7 @@ import sys
 HOME = os.path.expanduser("~")
 os.environ["PATH"] = f"{HOME}/.local/bin:/opt/homebrew/bin:{os.environ.get('PATH', '')}"
 SHELLS = {"zsh", "bash", "fish", "sh", "workmux"}  # workmux = the sidebar pane
+PROTECTED_BRANCH = re.compile(r"stable/.+")  # long-lived: a release works ON it, so `workmux remove` (which deletes the branch) is never right
 
 
 class Fail(Exception):
@@ -340,6 +343,9 @@ def plan(win, status):
         ok = False
         reasons.insert(0, f"{len(siblings)} other window{'' if len(siblings) == 1 else 's'} still sit in it: {', '.join(siblings)}")
     cwd = wt["project_path"]
+    if PROTECTED_BRANCH.fullmatch(wt["branch"] or ""):
+        ok = False
+        reasons.insert(0, f"{wt['branch']} is a stable branch: it is never deleted from here")
     if ok:
         lines.append("nothing uncommitted")
         return (f"Delete {name}  (worktree, branch and window)", lines,

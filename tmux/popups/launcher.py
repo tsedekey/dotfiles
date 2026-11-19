@@ -35,6 +35,11 @@ The launcher looks up the draft backport PRs the backport action opened because 
 `backport-<N>-to-stable/<X.Y>`) and starts one worktree window per PR with `workmux add <head> --pr <number>`, which checks the
 PR's branch out, named exactly as `backport-resolve` expects, and runs the skill there. Clean backports are not drafts and are
 skipped. `--case <number>` works on the CLI, `--dry-run` prints every launch.
+`branch:` (release): the workflow works ON an existing branch of origin that is derived from the typed key
+(`stable/optimize-{line}`: 8.6.30 -> stable/optimize-8.6). With `worktree: true` the launcher first makes sure that branch exists
+locally and is up to date (workmux would create a missing one from main), then runs `workmux add <branch>`. Launching again
+switches to the open window; with the window closed it reopens the existing worktree with `workmux open <handle> -p <prompt>`
+(`add -o` would reopen it but start the agent without the prompt); a second release on a line whose worktree is open is refused.
 `reuse: true` (daily): launching again switches to the window that is already open instead of starting a
 second one; `case_arg: false` keeps the case out of the skill's prompt.
 The session is the workflow's first word and is created when missing.  Every window is monitored
@@ -62,7 +67,7 @@ GH = os.environ.get("LAUNCHER_GH", "gh")  # tests point these two at stand-ins
 WORKMUX = os.environ.get("LAUNCHER_WORKMUX", "workmux")
 BACKPORT_HEAD = re.compile(r"backport-(\d+)-to-(.+)")  # the backport action's branch: backport-<original PR>-to-<target branch>
 FIELDS = {"worktree", "session", "agent", "model", "effort", "key_repo_root", "skill", "repo", "files", "workspaces", "case", "case_label",
-          "key", "ask", "extra_dirs", "hidden", "window", "reuse", "case_arg", "here", "backports"}
+          "key", "ask", "extra_dirs", "hidden", "window", "reuse", "case_arg", "here", "backports", "branch"}
 ASKABLE = {"epic", "case", "repo"}  # fields a workflow can make the plain Enter flow ask for
 SPLIT = "30%"  # shell pane BESIDE the agent (right), like workmux's `split: horizontal` layout; was 20%, widened by half
 
@@ -112,6 +117,7 @@ KEY_KINDS = {  # kind -> (what it is, example)
     "github-pr": ("GitHub pull request", "12345, repo#12345 or the PR URL"),
     "incident": ("incident.io reference", "INC-8745 or the incident.io URL"),
     "cve": ("CVE ID", "CVE-2026-47848"),
+    "optimize-release": ("Optimize release version", "8.6.30, v8.6.30 or 8.6.30-optimize"),
 }
 GITHUB_URL = re.compile(r"https?://github\.com/[\w.-]+/([\w.-]+)/(?:issues|pull)/(\d+)")
 GITHUB_REPO_NUM = re.compile(r"(?:[\w.-]+/)?([\w.-]+)#(\d+)")  # repo#123 or org/repo#123
@@ -120,6 +126,7 @@ GITHUB_FOLDER = re.compile(r"([A-Za-z](?:[\w.-]*[\w.])?)-(\d+)")  # a canonical 
 GITHUB_NESTED = re.compile(r"([A-Za-z][\w.-]*)/(\d+)")  # repo/123: the nested key (change), same as its folder
 EPIC_PREFIX = re.compile(r"[A-Za-z]+-\d+")  # pdp-3517: the short name of an epic repo (pdp-3517-variable-trace)
 INCIDENT_URL = re.compile(r"https?://app\.incident\.io/[\w.-]+/incidents/(\d+)")
+RELEASE_VERSION = re.compile(r"v?(\d+)\.(\d+)\.(\d+)(?:-optimize)?", re.I)  # 8.6.30, v8.6.30, 8.6.30-optimize (the tag name)
 
 
 def parse_key_kind(kind, where="key", runtime_repo=False):
@@ -127,7 +134,7 @@ def parse_key_kind(kind, where="key", runtime_repo=False):
     runtime_repo: a GitHub kind may leave the repo out, because the workflow learns it at launch (an epic)."""
     base, _, arg = (kind or "").partition(":")
     if base not in KEY_KINDS:
-        raise Fail(f"{where}: unknown key '{kind}'. Known: github-issue:<owner>/<repo>, github-pr:<owner>/<repo>, incident, cve")
+        raise Fail(f"{where}: unknown key '{kind}'. Known: github-issue:<owner>/<repo>, github-pr:<owner>/<repo>, incident, cve, optimize-release")
     repo = arg.rsplit("/", 1)[-1]
     if base.startswith("github") and not (arg.count("/") == 1 and repo and arg.split("/")[0]):
         if arg or not runtime_repo:
@@ -141,6 +148,11 @@ def short_repo(repo):
     without a `<letters>-<digits>` prefix (dmn-scala) keeps its whole name."""
     m = re.match(r"[A-Za-z]+-\d+(?=-|$)", repo)
     return m[0] if m else repo
+
+
+def release_line(version):
+    """8.6.30 -> 8.6: the release line, which names the stable branch."""
+    return version.rsplit(".", 1)[0]
 
 
 def normalize_key(kind, text, label="", default_repo=None, nested=False):
@@ -190,6 +202,11 @@ def key_info(kind, text, label="", default_repo=None, nested=False):
         if not m:
             raise bad
         return f"INC-{int(m[1])}", ""
+    if base == "optimize-release":
+        m = RELEASE_VERSION.fullmatch(text)
+        if not m:
+            raise bad
+        return f"{int(m[1])}.{int(m[2])}.{int(m[3])}", ""
     m = re.fullmatch(r"(?i)CVE-(\d{4})-(\d{4,})", text)  # cve
     if not m:
         raise bad
@@ -364,6 +381,15 @@ def load():
             raise Fail(f"{where}: agent '{w.get('agent')}' is not in {AGENTS_CONFIG} (have: {', '.join(agents)})")
         for k in ("repo", "files", "workspaces", "skill", "model", "effort", "key_repo_root", "window", "case", "case_label", "key"):
             w[k] = w.get(k) or ""
+        w["branch_template"] = str(w.pop("branch", "") or "")
+        if w["branch_template"]:
+            t = w["branch_template"]
+            if not w["worktree"]:
+                raise Fail(f"{where}: `branch` is the branch of the worktree, so it needs `worktree: true`")
+            if w["key"] != "optimize-release":
+                raise Fail(f"{where}: `branch` is derived from the key's {{line}} (8.6.30 -> 8.6), so it needs `key: optimize-release`")
+            if "{line}" not in t or "{" in t.replace("{line}", "") or "}" in t.replace("{line}", ""):
+                raise Fail(f"{where}: `branch` must contain {{line}} and no other braces, e.g. stable/optimize-{{line}} (got {t!r})")
         if w["here"] and (w["worktree"] or w["repo"] or w["files"] or w["workspaces"] or w["key"] or w["case"] or w.get("ask")):
             raise Fail(f"{where}: `here` starts in the checkout of the pane you launch from, so it excludes worktree, repo, files, workspaces, key, case and ask")
         if w["backports"]:
@@ -539,6 +565,7 @@ def make_plan(name, wfs, agents, o):
     if case and not p["files"] and not wf["backports"]:
         raise Fail("a case needs a files folder to live in")
     p["case"] = case
+    p["window"] = p["window"].replace("{case}", case.replace("/", "-"))  # `window: release-{case}`
     # "" when there is no files folder; an epic's task gets no folder of its own
     p["case_dir"] = "" if wf["backports"] else (os.path.join(p["files"], case) if case and not wf["workspaces"] else p["files"])
     p["cwd"] = p["repo"] or p["case_dir"]  # where the agent starts (the repo; a worktree is made from it)
@@ -557,8 +584,15 @@ def make_plan(name, wfs, agents, o):
         if p["effort"]:
             notes.append(f"default effort '{p['effort']}' ignored: workmux add has no effort flag")
             p["effort"] = ""
+        if not p["branch"] and wf["branch_template"]:  # 8.6.30 -> stable/optimize-8.6: the branch is not typed, it follows from the key
+            p["branch"] = wf["branch_template"].format(line=release_line(case))
         if not p["branch"]:
             raise Fail(f"'{name}' creates a worktree and needs a branch (--branch)")
+        p["open_handle"] = ""
+        if wf["branch_template"]:  # its worktree may already exist (window closed): then it is reopened, not created
+            there = worktree_of(p["repo"], p["branch"])
+            if there and os.path.realpath(there) != os.path.realpath(p["repo"]):
+                p["open_handle"] = os.path.basename(there)
     else:
         if p["branch"]:
             raise Fail("a branch only applies to a worktree (add --worktree)")
@@ -640,6 +674,14 @@ def agent_line(agents, agent, model, prompt="", extra=(), effort=""):
 
 
 def worktree_argv(p, switch):
+    if p.get("open_handle"):
+        # The worktree of this branch exists and has no window (closed with prefix + F, or a restart). `workmux add` has no way
+        # to start the agent with a prompt there (checked 2026-11-18: the agent came up empty); `workmux open -p` has. The agent
+        # is the one the worktree was created with, or the config default.
+        argv = [WORKMUX, "open", p["open_handle"], "--parent-session", p["session"]]
+        argv += ["--target-name", p["window"]] if p["window"] else []
+        argv += ["-p", p["prompt"]] if p["prompt"] else []
+        return argv + ([] if switch else ["-b"])
     argv = [WORKMUX, "add", p["branch"]] + (["--pr", str(p["pr"]), "-o"] if p.get("pr") else [])  # -o: open the worktree if it already exists
     argv += ["-a", p["agent"], "--parent-session", p["session"]]
     argv += ["--target-name", p["window"]] if p["window"] else []
@@ -658,7 +700,10 @@ def summary(p, agents, switch=True):
     out = [head] + [f"  note: {n}" for n in p["notes"]]
     out.append(f"  agent  {p['agent']}" + (f" ({p['model']})" if p["model"] else "") + (f", effort {p['effort']}" if p["effort"] else ""))
     out.append("  skill  " + (p["prompt"] if p["prompt"] else (f"{p['skill']} (not started automatically)" if p["skill"] else "(none)")))
-    out.append(f"  starts {short(p['cwd'])}" + ("  -> new worktree off it" if wt else "") + (f"  (branch {p['here_branch']}, the checkout you launched from)" if p.get("here_branch") else ""))
+    out.append(f"  starts {short(p['cwd'])}" + (((f"  -> reopen the worktree {p['open_handle']}" if p.get("open_handle") else "  -> worktree on " + p["branch"]) if p["branch_template"] else "  -> new worktree off it") if wt else "")
+               + (f"  (branch {p['here_branch']}, the checkout you launched from)" if p.get("here_branch") else ""))
+    if wt and p["branch_template"]:
+        out.append(f"  branch {p['branch']}  (derived from {p['case']}; must already exist on origin)")
     if p.get("pr"):
         t = p["pr_target"]
         out.append(f"  pr     #{t['number']} -> stable/{t['target']}, draft backport of #{t['original']}: {t['title'][:70]}")
@@ -718,6 +763,145 @@ def right_hand_pane(window):
     return max(panes)[2]
 
 
+# ---------------------------------------------------------------- a workflow on an existing branch (release)
+
+POM_VERSION = re.compile(r"<version>([^<]+)</version>")
+
+
+def git(repo, *args):
+    """(returncode, stdout, stderr) of `git -C repo ...`, stripped."""
+    r = subprocess.run(["git", "-C", repo, *args], capture_output=True, text=True)
+    return r.returncode, r.stdout.strip(), r.stderr.strip()
+
+
+def worktree_of(repo, branch):
+    """The folder of the worktree (the main checkout included) that has `branch` checked out, or ""."""
+    rc, out, _ = git(repo, "worktree", "list", "--porcelain")
+    path = ""
+    for line in out.splitlines() if not rc else []:
+        if line.startswith("worktree "):
+            path = line[len("worktree "):]
+        elif line == f"branch refs/heads/{branch}":
+            return path
+    return ""
+
+
+def windows_in(path):
+    """{window id: window name} of the tmux windows with a pane inside `path` (the agent's cwd is the worktree)."""
+    r = subprocess.run(["tmux", "list-panes", "-a", "-F", "#{window_id}\t#{window_name}\t#{pane_current_path}"], capture_output=True, text=True)
+    root, found = os.path.realpath(path), {}
+    for line in r.stdout.splitlines() if not r.returncode else []:
+        wid, _, rest = line.partition("\t")
+        name, _, cwd = rest.partition("\t")
+        cwd = os.path.realpath(cwd)
+        if cwd == root or cwd.startswith(root + os.sep):
+            found[wid] = name
+    return found
+
+
+def window_matches(name, window):
+    """Is tmux window `name` the one workmux opened for `window`? workmux turns dots into dashes (release-8.6.30 ->
+    release-8-6-30) and may put a prefix in front (an icon, or `wm-`), so compare the end of the name, on a boundary."""
+    for w in {window, window.replace(".", "-")}:
+        if name == w or (name.endswith(w) and not name[-len(w) - 1].isalnum()):
+            return True
+    return False
+
+
+def reopen_or_refuse(p, switch, dry):
+    """A worktree for this branch that is already open. -> True when there is nothing left to do (the window of this very
+    release is open: go back to it). Raises Fail when another release holds the worktree (git allows a branch in one
+    worktree, and a second agent in it would push the same branch). -> False: no window, start one (`workmux add`, or `workmux open -p` when the worktree exists)."""
+    where = worktree_of(p["repo"], p["branch"])
+    if not where:
+        return False
+    if os.path.realpath(where) == os.path.realpath(p["repo"]):
+        raise Fail(f"{p['branch']} is checked out in the main checkout {short(where)}: a release works in its own worktree. "
+                   f"Check another branch out there first (git -C {short(where)} switch main), then launch again.")
+    open_in = windows_in(where)
+    mine = [wid for wid, name in open_in.items() if window_matches(name, p["window"])]
+    if mine:
+        if switch and not dry:
+            tmux("switch-client", "-t", mine[0])
+        print(f"  already open: {p['session']}:{p['window']}" + (", switched to it" if switch and not dry else " (nothing started)"))
+        return True
+    if open_in:
+        names = ", ".join(sorted(open_in.values()))
+        raise Fail(f"{p['branch']} is already open in {names} ({short(where)}). One release per line at a time: "
+                   f"finish that window first (prefix + F), or launch its own version again to go back to it.")
+    return False
+
+
+def pom_note(repo, branch, version, from_last_fetch=False):
+    """A warning when origin's next version for `branch` is not the typed release, else None."""
+    rc, out, _ = git(repo, "show", f"origin/{branch}:optimize/pom.xml")
+    m = POM_VERSION.search(out) if not rc else None
+    if not m:
+        return None
+    nxt = m[1].removesuffix("-SNAPSHOT")
+    if nxt == version:
+        return None
+    return (f"origin/{branch}'s optimize/pom.xml says {m[1]}" + (" (as of the last fetch)" if from_last_fetch else "")
+            + f", so the next release of this line is {nxt}, not {version}: check the version you typed")
+
+
+def prepare_branch(p, dry):
+    """Before `workmux add` on an existing branch of origin: make the local branch exist and be current. workmux
+    would create a missing branch from main (`base_branch: auto`), so it must never be left to do that. Returns notes.
+    Raises Fail when origin has no such branch or the local one has diverged. dry: change nothing, only look."""
+    repo, branch, version = p["repo"], p["branch"], p["case"]
+    ref = f"refs/heads/{branch}"
+    rc, out, err = git(repo, "ls-remote", "--heads", "origin", ref)
+    if rc:
+        raise Fail(f"cannot ask origin of {short(repo)} about {branch}: {err or 'git ls-remote failed'}")
+    remote = next((l.split()[0] for l in out.splitlines() if l.split()[1:] == [ref]), "")
+    if not remote:
+        raise Fail(f"origin has no branch {branch}, so there is nothing to release from. This workflow only handles lines that "
+                   f"have one (the Optimize 8.6 and 8.7 lines have stable/optimize-X.Y). Type a version of such a line, "
+                   f"or name the branch in the Tab flow.")
+    local = git(repo, "rev-parse", "--verify", "--quiet", ref)[1]
+    where = worktree_of(repo, branch)
+    notes = []
+    if dry:
+        if not local:
+            notes.append(f"would create local {branch} tracking origin/{branch} (it does not exist locally)")
+        elif local == remote:
+            notes.append(f"local {branch} is up to date with origin")
+        else:
+            notes.append(f"local {branch} differs from origin: would fetch and fast-forward it (refused if it has diverged)")
+        if where:
+            notes.append(f"{branch} already has a worktree: {short(where)}")
+        note = pom_note(repo, branch, version, from_last_fetch=True)
+        return notes + ([note] if note else [])
+    rc, _, err = git(repo, "fetch", "--quiet", "origin", f"+{ref}:refs/remotes/origin/{branch}")
+    if rc:
+        raise Fail(f"git fetch origin {branch} failed: {err}")
+    if not local:
+        rc, _, err = git(repo, "branch", "--track", branch, f"origin/{branch}")
+        if rc:
+            raise Fail(f"could not create local {branch} from origin/{branch}: {err}")
+        notes.append(f"created local {branch} from origin/{branch}")
+    else:
+        if not git(repo, "config", "--get", f"branch.{branch}.remote")[1]:
+            git(repo, "branch", f"--set-upstream-to=origin/{branch}", branch)
+        ahead, behind = (int(x) for x in git(repo, "rev-list", "--left-right", "--count", f"{branch}...origin/{branch}")[1].split())
+        if ahead and behind:
+            raise Fail(f"local {branch} has diverged from origin ({ahead} local, {behind} remote commits). "
+                       f"Sort that out by hand (git -C {short(repo)} log {branch}...origin/{branch}), then launch again.")
+        if ahead:
+            notes.append(f"local {branch} has {ahead} commit(s) that origin does not: left as it is")
+        elif behind and where:
+            notes.append(f"local {branch} is {behind} commit(s) behind origin and checked out in {short(where)}: "
+                         f"the skill fast-forwards it there (git merge --ff-only)")
+        elif behind:
+            rc, _, err = git(repo, "update-ref", ref, f"origin/{branch}", local)  # compare-and-swap: only if nobody moved it meanwhile
+            if rc:
+                raise Fail(f"could not fast-forward local {branch}: {err}")
+            notes.append(f"fast-forwarded local {branch} by {behind} commit(s) to origin/{branch}")
+    note = pom_note(repo, branch, version)
+    return notes + ([note] if note else [])
+
+
 def launch(p, agents, dry, switch, show=True):
     start_window(p, agents, dry, switch, show)
     if dry or not p.get("workspace_root"):
@@ -730,6 +914,12 @@ def launch(p, agents, dry, switch, show=True):
 def start_window(p, agents, dry, switch, show=True):
     if show:
         print(summary(p, agents, switch))
+    on_branch = p["worktree"] and p["branch_template"]
+    if on_branch:  # checked before anything is created; with --dry-run it only looks
+        for n in prepare_branch(p, dry):
+            print(f"  note: {n}")
+        if reopen_or_refuse(p, switch, dry):
+            return
     if dry:
         return
     s, cwd = p["session"], p["cwd"]
@@ -1151,6 +1341,8 @@ def edit(wf, agents, o):
     if not ws:
         o["files"] = ask("files folder (empty = none)", wf["files"], path_completer)
     o["case"] = ask_case(wf, "" if ws else norm(o["files"]), settings.get("issues", ""))
+    if wf["branch_template"] and o["worktree"]:  # derived from the version; typing one overrides it (it must exist on origin)
+        o["branch"] = ask(f"branch (empty = derived: {wf['branch_template']})", "")
 
 
 def gh_json(*args):
@@ -1201,9 +1393,10 @@ def discover_backports(wf, text):
     return targets, notes
 
 
-def backport_window(session, window):
-    """The id of the window already open for this backport, or None. workmux turns dots into dashes in a window name
-    (backport-69172-8.8 -> backport-69172-8-8) and may put an icon in front, so compare the plain forms."""
+def worktree_window(session, window):
+    """The id of the window already open for this worktree launch (a backport, a release), or None. workmux turns dots
+    into dashes in a window name (backport-69172-8.8 -> backport-69172-8-8) and may put an icon in front, so compare the
+    plain forms."""
     r = subprocess.run(["tmux", "list-windows", "-t", f"={session}:", "-F", "#{window_id} #{window_name}"], capture_output=True, text=True)
     want = {window, window.replace(".", "-")}
     for line in r.stdout.splitlines() if not r.returncode else []:
@@ -1226,7 +1419,7 @@ def run_backports(name, wfs, agents, o, args, review=False):
     plans, reopen = [], None
     for i, t in enumerate(targets):  # one window each; the client follows only the first
         plan = make_plan(name, wfs, agents, dict(o, pr_target=t))
-        have = backport_window(plan["session"], plan["window"])
+        have = worktree_window(plan["session"], plan["window"])
         if have:  # `workmux add -o` on an open worktree adds another agent to the same window: two writers on one branch
             print(f"  already open: {plan['session']}:{plan['window']} (not started again: a second agent in that worktree would push the same branch)")
             if i == 0:
@@ -1261,12 +1454,12 @@ def run(args):
             print(f"\n  {name}:  Enter keeps the value   '-' clears it   Esc cancels")
             edit(wf, agents, o)
         wants_worktree = wf["worktree"] if o["worktree"] is None else o["worktree"]
-        needs_branch = wants_worktree and not o["branch"] and not wf["backports"]
+        needs_branch = wants_worktree and not o["branch"] and not wf["backports"] and not wf["branch_template"]
         if not want_edit and (wf["ask"] or needs_branch):
             print(f"\n  {name}:  Enter keeps the value   Esc cancels")
             quick(wf, o)
             wants_worktree = wf["worktree"] if o["worktree"] is None else o["worktree"]
-        if wants_worktree and not o["branch"] and not wf["backports"]:
+        if wants_worktree and not o["branch"] and not wf["backports"] and not wf["branch_template"]:
             o["branch"] = ask("branch (required)")
         if want_edit:  # edited by hand: show the result and let the user back out before anything exists
             if wf["backports"]:
