@@ -188,7 +188,10 @@ workflows:
   backport:                            # draft backport PRs that hit a conflict: one worktree window per PR
     backports: true
     worktree: true
-    agent: claude                      # --agent claude-safe makes it ask before each write and push; backport-resolve pushes to the backport branch
+    agent: copilot                     # Copilot by default (Eddie, 2026-11-23; it was Claude only because that was the first entry written, no reason recorded). The prompt reaches it
+                                       # through the copilot-prompt wrapper (see the copilot agent in config.yaml). Tradeoff: Copilot has no ask-first mode and
+                                       # backport-resolve force-pushes the backport branch (lease-guarded; it waits for your OK only before `gh pr ready`).
+                                       # For a prompt before every write and push use Claude: `launcher.py backport --agent claude-safe`, or type claude-safe in the Tab flow.
     skill: backport-resolve
     repo: ~/dev/camunda/camunda
     key: github-pr:camunda/camunda

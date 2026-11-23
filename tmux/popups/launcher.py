@@ -302,15 +302,25 @@ EFFORTS = {"claude": ("low", "medium", "high", "xhigh", "max"),
            "copilot": ("none", "minimal", "low", "medium", "high", "xhigh", "max")}
 
 
+COPILOT_WRAPPER = "copilot-prompt"  # dotfiles/workmux/copilot-prompt: workmux's `-- <prompt>` becomes Copilot's `-i <prompt>`, then it execs copilot
+
+
 def agent_kind(a):
     cmd = os.path.basename(str(a.get("command", "")))
     if a.get("type") == "claude" or cmd == "claude":
         return "claude"
-    if cmd == "copilot":
+    if cmd in ("copilot", COPILOT_WRAPPER):
         return "copilot"
     if a.get("type") == "opencode" or "opencode" in cmd:
         return "opencode"
     return "other"
+
+
+def takes_workmux_prompt(a):
+    """Does `workmux add -p` reach this agent as its first prompt? Claude: yes (workmux's own profile). Copilot: only when its
+    command is the copilot-prompt wrapper, which turns workmux's `-- <prompt>` into `-i <prompt>`. Anything else would get a
+    bare `-- <prompt>` it cannot read (a Copilot that never starts a session never shows in the sidebar)."""
+    return agent_kind(a) == "claude" or os.path.basename(str(a.get("command", ""))) == COPILOT_WRAPPER
 
 
 def skill_roots(a):
@@ -633,9 +643,10 @@ def make_plan(name, wfs, agents, o):
         notes.append("extra dirs not passed: " + ("workmux add builds the agent command" if p["worktree"]
                                                   else f"'{p['agent']}' has no --add-dir"))
         extra = []
-    if p["worktree"] and prompt and kind != "claude":
+    if p["worktree"] and prompt and not takes_workmux_prompt(agents[p["agent"]]):
         # workmux runs `<agent> -- "$(cat .workmux/PROMPT-x.md)"`. Claude takes that as its first prompt;
-        # the real Copilot CLI answers "unrecognized subcommand" and exits (tested 2026-11-10).
+        # the real Copilot CLI answers "unrecognized subcommand" and exits (tested 2026-11-10), which is why a Copilot
+        # agent needs the copilot-prompt wrapper as its command (2026-11-23); without it the prompt is dropped, as before.
         notes.append(f"workmux cannot hand the prompt to '{p['agent']}' (it passes `-- <prompt>`): type {prompt}")
         prompt = ""
     elif p["worktree"] and prompt and not workmux_prompt_is_ignored(p["repo"]):

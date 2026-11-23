@@ -1,0 +1,25 @@
+#!/bin/bash
+# copilot-prompt: start the real `copilot`, turning workmux's trailing `-- <prompt>` into `-i <prompt>`.
+#
+# WHY: Copilot has no built-in workmux profile, so for `workmux add ... -p <prompt>` workmux starts it as
+#     <command> <args> -- "$(cat .workmux/PROMPT-<branch>.md)"
+# and the Copilot CLI answers that `--` with "unrecognized subcommand" and exits (checked live 2026-11-10 and
+# again 2026-11-23 with workmux 0.1.279). `-i <prompt>` is Copilot's spelling of "start an interactive session
+# with this first prompt"; it is what the launcher's own non-worktree path already sends.
+#
+# RULE: only when the LAST TWO arguments are `--` and a prompt are they rewritten to `-i <prompt>`. Every other
+# call is passed through unchanged: the launcher's own `-i`, `workmux open` with no prompt, `copilot help config`,
+# `copilot --version`. An empty prompt is dropped together with the `--`.
+#
+# `exec`, so the pane's process is the real Copilot: workmux's hooks, the sidebar icon (`agent_kind`) and
+# tmux-resurrect see `copilot`, not a bash wrapper. The wrapper is NOT named `copilot`, so it can never call itself.
+#
+# Used as `command:` of the `copilot` and `copilot-long` agents in workmux/config.yaml, through the link
+# ~/.local/bin/copilot-prompt that install.sh makes. COPILOT_PROMPT_REAL names another binary (tests, stubs).
+real=${COPILOT_PROMPT_REAL:-copilot}
+if [ "$#" -ge 2 ] && [ "${@: -2:1}" = "--" ]; then
+  prompt="${@: -1}"   # quoted: bash 3.2 (macOS /bin/bash) word-splits an unquoted ${@: -1} and loses newlines
+  set -- "${@:1:$(($# - 2))}"
+  [ -n "$prompt" ] && set -- "$@" -i "$prompt"
+fi
+exec "$real" "$@"

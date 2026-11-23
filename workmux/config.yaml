@@ -94,14 +94,21 @@ agents:
       PLANNOTATOR_PLAN_REVIEW: "0"      # inert on pinned v0.28.51; honoured after an upgrade
       CLAUDE_CONFIG_DIR: /Users/eddie.tsedeke/.claude-personal
 
-  # GitHub Copilot CLI. No built-in launch profile, so it is a plain command; status
-  # tracking comes from hooks in ~/.copilot/hooks (added by `workmux setup`).
+  # GitHub Copilot CLI. No built-in workmux launch profile, so it is a plain command; status
+  # tracking comes from hooks in ~/.copilot/hooks (added by `workmux setup`). Those hooks fire only
+  # once a SESSION has started, so a Copilot that never got a first prompt never shows in the sidebar.
   # Copilot has no "waiting" status icon.
   # Default = --allow-all (explicit here so it does not depend on ~/.copilot/settings.json).
   # No "-safe" variant: Copilot has no CLI flag to force manual mode while your settings
   # say allow-all; restrict by changing defaultPermissionMode in ~/.copilot/settings.json.
+  # COMMAND = the copilot-prompt wrapper (dotfiles/workmux/copilot-prompt, linked into ~/.local/bin by install.sh), not `copilot`
+  # itself (decided 2026-11-23). For a worktree's first prompt (`workmux add -p`) workmux types `<command> <args> -- "$(cat PROMPT)"`,
+  # which Copilot rejects ("unrecognized subcommand") and workmux has no Copilot profile to do better. The wrapper turns that
+  # trailing `-- <prompt>` into `-i <prompt>` and then `exec`s the real copilot, so every other call is unchanged and the pane
+  # still runs plain `copilot` (hooks, sidebar icon, tmux-resurrect). The launcher (agent_kind) and tmux/resurrect/agents.py
+  # recognise the wrapper by its file name: keep the name `copilot-prompt` in all three places.
   copilot:
-    command: copilot
+    command: /Users/eddie.tsedeke/.local/bin/copilot-prompt
     args:
       - --allow-all
     env:
@@ -116,7 +123,7 @@ agents:
   # completion. Model (claude-sonnet-5.5) and effort come from ~/.copilot/settings.json.
   #   wm add <branch> -a copilot-long
   copilot-long:
-    command: copilot
+    command: /Users/eddie.tsedeke/.local/bin/copilot-prompt   # the wrapper, see `copilot` above
     args:
       - --allow-all
       - --context

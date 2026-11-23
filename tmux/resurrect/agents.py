@@ -500,7 +500,8 @@ def build_line(rec, workmux_agents, pane_cwd):
             argv += ["--model", rec["model"]]
         argv += ["--resume", sid]
     elif kind == "copilot":
-        env = profile_env(lambda a: os.path.basename(str(a.get("command", ""))) == "copilot")
+        # `copilot-prompt` is the workmux wrapper that the copilot agents use as their command (dotfiles/workmux/copilot-prompt)
+        env = profile_env(lambda a: os.path.basename(str(a.get("command", ""))) in ("copilot", "copilot-prompt"))
         argv = ["copilot", *rec.get("argv", []), "--resume", sid]
     elif kind == "opencode":
         want = rec.get("permission")

@@ -109,6 +109,13 @@ link_file "$DOTFILES_DIR/tmux/phone/ph-annotate" "$HOME/.local/bin/ph-annotate"
 link_file "$DOTFILES_DIR/tmux/phone/phone-hub"   "$HOME/.local/bin/phone-hub"
 echo ""
 
+# --- Copilot prompt wrapper (workmux/copilot-prompt) ---
+# The `command:` of the copilot and copilot-long agents in workmux/config.yaml. workmux hands a worktree's first prompt to an
+# agent it has no profile for as `-- <prompt>`, which Copilot rejects; the wrapper turns it into `-i <prompt>`.
+info "Copilot prompt wrapper"
+link_file "$DOTFILES_DIR/workmux/copilot-prompt" "$HOME/.local/bin/copilot-prompt"
+echo ""
+
 # --- Agent icon font (Claude / OpenCode logos for the workmux sidebar) ---
 # Copied, not symlinked: CoreText is not guaranteed to follow symlinks in ~/Library/Fonts.
 # Ghostty maps U+E400-E403 to it (font-codepoint-map in ghostty/config). Rebuild with
