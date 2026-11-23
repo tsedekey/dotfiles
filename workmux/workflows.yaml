@@ -12,6 +12,8 @@
 #           there, so profiles never drift). Typos are a load error, not a runtime surprise.
 #   model   passed as `--model <model>`; empty = the harness' own default. workmux add has no model
 #           flag, so with a worktree the default is ignored (with a note) and an explicit --model errors.
+#           Tab flow: the field starts on this value (or, when empty or when you pick another agent, on that agent's own
+#           default model) and Tab lists every model the chosen agent offers. Not asked for a worktree window.
 #   effort  reasoning effort for the session: low | medium | high | xhigh | max (Copilot also none | minimal).
 #           Passed as `--effort <level>` to Claude and `--reasoning-effort <level>` to Copilot; empty = the
 #           harness' own `effortLevel` setting (both are "high" today). Which levels work depends on the

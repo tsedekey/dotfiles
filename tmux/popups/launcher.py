@@ -4,7 +4,11 @@
   popup    Pick a workflow in fzf.  Enter = launch with its defaults (a workflow may first ask for its case,
            and for a repo).  Tab = edit every field first.  In the path fields (repo, files, case, skill)
            Tab lists what is in the folder typed so far and you pick from it instead of looking it up.
-  CLI      launcher.py review [--agent A] [--skill S] [--model M] [--effort E] [--name N] [--repo R] [--files F]
+           The model field starts on the agent's own default model (its `--model` in config.yaml, else the harness'
+           `model` setting; a changed agent starts from ITS default, never the old agent's spelling) and Tab lists
+           the models that agent offers: Claude from its cached model catalog, Copilot from `copilot help config`,
+           OpenCode from `opencode models <provider>`. Looked up on the first Tab only; a name typed by hand is never refused.
+  CLI     launcher.py review [--agent A] [--skill S] [--model M] [--effort E] [--name N] [--repo R] [--files F]
            [--case C] [--branch B] [--prompt P] [--[no-]worktree] [--dry-run] [--no-switch].
            Naming a workflow skips the UI and NEVER prompts (scripts, tests and other agents use this;
            hidden workflows such as `dagrunner` can only be started this way).
@@ -50,6 +54,7 @@ Env: LAUNCHER_WORKFLOWS / LAUNCHER_AGENTS_CONFIG override the two config paths (
 """
 import argparse
 import datetime
+import glob
 import json
 import os
 import re
@@ -355,6 +360,118 @@ def skill_switched_off(a, skill):
             return path if (json.load(f).get("skillOverrides") or {}).get(skill) == "off" else None
     except (OSError, ValueError, AttributeError):
         return None
+
+
+# --- models: what the Tab list on the model field offers, found per agent when you press Tab (never at startup)
+
+MODEL_LIST_TIMEOUT = 8  # seconds; `opencode models` takes ~2 s, `copilot help config` ~0.5 s
+
+
+def own_model_arg(a):
+    """The `--model X` an agent's config.yaml entry already passes (OpenCode's default model), or ''."""
+    args = [str(x) for x in a.get("args") or []]
+    for i, x in enumerate(args):
+        if x == "--model" and i + 1 < len(args):
+            return args[i + 1]
+        if x.startswith("--model="):
+            return x.partition("=")[2]
+    return ""
+
+
+def settings_model(a):
+    """The `model` the harness itself starts with (Claude: <profile>/settings.json, Copilot: <home>/settings.json), or ''."""
+    env, kind = a.get("env") or {}, agent_kind(a)
+    if kind == "claude":
+        path = os.path.join(env.get("CLAUDE_CONFIG_DIR", f"{HOME}/.claude"), "settings.json")
+    elif kind == "copilot":
+        path = os.path.join(env.get("COPILOT_HOME", f"{HOME}/.copilot"), "settings.json")
+    else:
+        return ""
+    try:
+        with open(path) as f:
+            model = json.load(f).get("model")
+        return model if isinstance(model, str) else ""
+    except (OSError, ValueError, AttributeError):
+        return ""
+
+
+def default_model(a):
+    """The model this agent runs when none is named: its own `--model` in config.yaml, else its harness setting."""
+    return own_model_arg(a) or settings_model(a)
+
+
+def claude_models(a):
+    """Claude Code caches the model catalog its /model picker uses in <profile>/cache/model-catalog (an internal file,
+    so every step is optional): the newest catalog's `main` models first, then `overflow`, with the aliases (`opus`,
+    `sonnet`...) that --model also takes. Models listed in masked-ids.json are hidden, as in the picker."""
+    root = os.path.join((a.get("env") or {}).get("CLAUDE_CONFIG_DIR", f"{HOME}/.claude"), "cache", "model-catalog")
+    newest = (-1, [])
+    for path in glob.glob(os.path.join(root, "*-cc.json")):
+        try:
+            with open(path) as f:
+                doc = json.load(f)
+            if doc["fetchedAt"] > newest[0]:
+                newest = (doc["fetchedAt"], doc["catalog"]["config"]["models"])
+        except (OSError, ValueError, KeyError, TypeError):
+            continue
+    try:
+        with open(os.path.join(root, "masked-ids.json")) as f:
+            masked = set(json.load(f).get("ids") or [])
+    except (OSError, ValueError, AttributeError):
+        masked = set()
+    models = [m for m in newest[1] if isinstance(m, dict) and m.get("id") and m["id"] not in masked]
+    main = [m for m in models if m.get("section") == "main"]
+    return ([str(m["short_name"]).lower() for m in main if m.get("short_name")]
+            + [m["id"] for m in main] + [m["id"] for m in models if m.get("section") != "main"])
+
+
+def command_lines(argv, env):
+    """stdout lines of a short read-only command; [] when it is missing, slow or fails."""
+    try:
+        r = subprocess.run(argv, capture_output=True, text=True, timeout=MODEL_LIST_TIMEOUT, env={**os.environ, **env})
+    except (OSError, subprocess.SubprocessError):
+        return []
+    return r.stdout.splitlines() if r.returncode == 0 else []
+
+
+def copilot_models(a):
+    """`copilot help config` documents the accepted `model` values (a list under the `model` setting); `auto` is --model's own."""
+    env = {k: str(v) for k, v in (a.get("env") or {}).items()}
+    found, inside = [], False
+    for line in command_lines([str(a["command"]), "help", "config"], env):
+        if line.startswith("  `model`:"):
+            inside = True
+        elif inside:
+            m = re.fullmatch(r'\s+- "([^"]+)"', line)
+            if not m:
+                break
+            found.append(m[1])
+    return (["auto"] + found) if found else []
+
+
+def opencode_models(a):
+    """`opencode models <provider>`, the provider being the one in the agent's own `--model provider/model`, so an
+    OpenRouter agent lists OpenRouter's models and not all 450. Runs the plain `opencode`, not the agent's wrapper,
+    which would read the API key from the keychain just to print a list."""
+    provider = own_model_arg(a).partition("/")[0] if "/" in own_model_arg(a) else ""
+    env = {k: str(v) for k, v in (a.get("env") or {}).items()}
+    return [x.strip() for x in command_lines(["opencode", "models", *([provider] if provider else [])], env) if x.strip()]
+
+
+def models_for(a):
+    """Every model worth offering for this agent, best guess first: its default, then what the harness reports.
+    Never raises: a cache that moved or a command that is gone only makes the list shorter (a model typed by hand
+    is never rejected: these lists are caches, and each harness also takes names that are not in them)."""
+    found = {"claude": claude_models, "copilot": copilot_models, "opencode": opencode_models}.get(agent_kind(a), lambda _: [])
+    try:
+        listed = found(a)
+    except Exception:
+        listed = []
+    out = []
+    for m in [default_model(a), *listed]:
+        if m and m not in out:
+            out.append(m)
+    return out
 
 
 def load():
@@ -1296,11 +1413,32 @@ def quick(wf, o):
             o["repo"] = ask("repo (empty = none)", wf["repo"], path_completer)
 
 
+def model_completer(a, keep=()):
+    """Tab on the model field: this agent's models. They are looked up on the first Tab (OpenCode takes ~2 s) and kept for
+    the rest of the popup. When the field holds exactly one of them (the default it started with) Tab lists them all."""
+    cache = []
+
+    def complete(text):
+        if not cache:
+            if sys.stdout.isatty():
+                sys.stdout.write("\r\033[K  listing models...")
+                sys.stdout.flush()
+            cache.append(list(dict.fromkeys(m for m in [*keep, *models_for(a)] if m)))
+        return "", "" if text in cache[0] else text, cache[0], ""
+    return complete
+
+
 def ask_model_effort(wf, agents, o):
-    same = o["agent"] == wf["agent"]  # the workflow's model belongs to its own agent
-    o["model"] = ask("model (empty = harness default)" if same else "model (agent changed: harness default)",
-                     wf["model"] if same else "")
-    kind = agent_kind(agents[o["agent"]])
+    a = agents[o["agent"]]
+    same = o["agent"] == wf["agent"]  # the workflow's model belongs to its own agent: another agent starts from its own default
+    default = (wf["model"] if same else "") or default_model(a)  # never blank when the harness has a default to show
+    o["model"] = ask("model (empty = harness default)" if same else "model (agent changed: its own default)",
+                     default, model_completer(a, [default]) if agent_kind(a) != "other" else None)
+    if o["model"] == default_model(a) and not (same and wf["model"]):
+        # The prefilled default, taken as it stood: no model was chosen, so no `--model` is sent and the harness decides, as
+        # before. A `--model` would also beat a project-level model setting or an env var that the shown default knows nothing of.
+        o["model"] = ""
+    kind = agent_kind(a)
     if kind in EFFORT_FLAG:
         while True:
             o["effort"] = ask(f"effort ({', '.join(EFFORTS[kind])}; empty = harness default)"
