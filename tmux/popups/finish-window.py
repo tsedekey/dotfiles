@@ -395,7 +395,13 @@ def main():
         # popup sits over would otherwise race the popup). A failure shows in the status line.
         cmd = (f"sleep 0.4; cd {shlex.quote(cwd)} && " if cwd else "sleep 0.4; ") + shlex.join(argv)
         cmd += f" || tmux display-message -d 8000 {shlex.quote('finish-window FAILED: ' + shlex.join(argv))}"
-        subprocess.Popen(["tmux", "run-shell", "-b", cmd])
+        # Wait for this tmux client to return: it has then handed the job to the server, which runs it (-b returns at
+        # once, the sleep and the close happen server-side). Starting it and exiting immediately lost the race: the
+        # popup closes with this process, and tmux hangs up the process group, so the client could die before it reached
+        # the server and then nothing ran at all (found 2026-11-23: popup closes, window stays; 0 of 4 closed).
+        rc, _, err = run(["tmux", "run-shell", "-b", cmd], timeout=10)
+        if rc:
+            raise Fail(f"could not hand the close to tmux: {err or 'tmux run-shell failed'}")
     except Exception as e:  # Fail, or an unexpected crash: keep the message on screen either way
         import traceback
         if not isinstance(e, Fail):

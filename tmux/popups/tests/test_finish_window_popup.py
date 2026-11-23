@@ -297,5 +297,48 @@ class CaseLines(unittest.TestCase):
         self.assertEqual(fw.case_lines(None, {"id": "@1"}, {"path": "/w"}, {}), [])
 
 
+class AnswerYes(unittest.TestCase):
+    """What happens after `y`. 2026-11-23: the popup started `tmux run-shell -b` and exited at once; the popup's close hung
+    up that just-started client before it reached the server, so nothing was closed (0 of 4 on a real tmux client). The
+    popup must wait for the client to return, and say so when tmux refuses the job."""
+
+    def run_main(self, run_result):
+        calls, popen_calls = [], []
+        saved = {k: getattr(fw, k) for k in ("getkey", "window_info", "agent_status", "plan", "run")}
+        saved_popen, saved_argv, saved_which = fw.subprocess.Popen, sys.argv, fw.shutil.which
+        fw.getkey = lambda: "y"
+        fw.window_info = lambda wid: {"id": wid}
+        fw.agent_status = lambda: {}
+        fw.plan = lambda win, status: ("Delete x", [], (["workmux", "remove", "-f", "h"], "/proj"))
+        fw.run = lambda cmd, cwd=None, timeout=20: (calls.append((cmd, timeout)) or run_result)
+        fw.subprocess.Popen = lambda *a, **k: popen_calls.append(a) or types.SimpleNamespace(pid=1)
+        fw.shutil.which = lambda name: "/bin/" + name
+        sys.argv = ["finish-window.py", "@5"]
+        try:
+            fw.main()
+            return calls, popen_calls, None
+        except SystemExit as e:
+            return calls, popen_calls, e.code
+        finally:
+            for k, v in saved.items():
+                setattr(fw, k, v)
+            fw.subprocess.Popen, sys.argv, fw.shutil.which = saved_popen, saved_argv, saved_which
+
+    def test_the_close_is_handed_to_tmux_and_waited_for(self):
+        calls, popen_calls, code = self.run_main((0, "", ""))
+        self.assertEqual(popen_calls, [], "a fire-and-forget Popen can be killed by the popup closing before it reaches tmux")
+        self.assertIsNone(code)
+        self.assertEqual(len(calls), 1)
+        argv, timeout = calls[0]
+        self.assertEqual(argv[:3], ["tmux", "run-shell", "-b"])
+        self.assertIn("cd /proj && workmux remove -f h", argv[3])
+        self.assertIn("finish-window FAILED", argv[3])  # the status-line message if the close itself fails
+        self.assertGreater(timeout, 0)
+
+    def test_tmux_refusing_the_job_is_an_error_not_silence(self):
+        calls, popen_calls, code = self.run_main((1, "", "no server running"))
+        self.assertEqual(code, 1)
+
+
 if __name__ == "__main__":
     unittest.main()
