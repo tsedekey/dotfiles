@@ -54,6 +54,7 @@ Env: LAUNCHER_WORKFLOWS / LAUNCHER_AGENTS_CONFIG override the two config paths (
 """
 import argparse
 import datetime
+import fcntl
 import glob
 import json
 import os
@@ -62,6 +63,7 @@ import select
 import shlex
 import subprocess
 import sys
+import time
 
 HOME = os.path.expanduser("~")
 # tmux's global PATH does not include ~/.local/bin (claude, plannotator) or Homebrew's fzf.
@@ -807,45 +809,96 @@ def claude_config_file(a):
     return os.path.join(d, ".claude.json") if d else os.path.join(HOME, ".claude.json")
 
 
-def trust_folder(a, folder):
-    """Record "trust this folder" for a Claude agent, so a fresh case folder starts the skill at once instead of sitting at
-    Claude's "Do you trust this folder?" prompt (INC-9355, 2026-11-25: the window looked dead for 11 minutes, with no
-    transcript yet, so no session list showed it). Only called for the case folder the launcher itself just made under
-    the workflow's own files root. Returns a note when it added the entry, "" when there was nothing to do.
+def copilot_config_file(a):
+    """Copilot CLI's trust list lives in $COPILOT_HOME/config.json (`trustedFolders`), default ~/.copilot/config.json."""
+    return os.path.join((a.get("env") or {}).get("COPILOT_HOME") or os.path.join(HOME, ".copilot"), "config.json")
 
-    Never raises and never creates the config file: if anything is off, Claude simply asks as before. The write is atomic
-    (temp file + rename) and keeps the file's mode and Claude's own formatting (2-space JSON, no final newline), checked
-    byte-identical on the real files 2026-11-25. A Claude that saves the same file in that millisecond could still win
-    the race, which at worst costs one trust entry or one counter."""
-    if agent_kind(a) != "claude":
-        return ""
-    path, key = claude_config_file(a), os.path.realpath(folder)
+
+def write_atomically(path, text):
+    """Replace `path` with `text` via a temp file + rename, keeping the file's mode."""
+    tmp = f"{path}.launcher-{os.getpid()}.tmp"
     try:
+        with open(tmp, "w") as f:
+            f.write(text)
+        os.chmod(tmp, os.stat(path).st_mode & 0o7777)
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+
+
+def trust_in_claude_config(a, key):
+    """Claude: projects[<folder>].hasTrustDialogAccepted = true, with the defaults Claude writes itself. Returns the config
+    file it changed, "" when the folder was already trusted."""
+    path = claude_config_file(a)
+    with open(path) as f:
+        cfg = json.load(f)
+    projects = cfg.get("projects")
+    if not isinstance(projects, dict) or (projects.get(key) or {}).get("hasTrustDialogAccepted"):
+        return ""
+    entry = projects.setdefault(key, {})
+    if not isinstance(entry, dict):
+        return ""
+    for k, v in (("allowedTools", []), ("mcpContextUris", []), ("mcpServers", {}), ("enabledMcpjsonServers", []),
+                 ("disabledMcpjsonServers", []), ("hasClaudeMdExternalIncludesApproved", False),
+                 ("hasClaudeMdExternalIncludesWarningShown", False)):
+        entry.setdefault(k, v)
+    entry["hasTrustDialogAccepted"] = True
+    write_atomically(path, json.dumps(cfg, indent=2, ensure_ascii=False))
+    return path
+
+
+def trust_in_copilot_config(a, key):
+    """Copilot: append the folder to `trustedFolders`. config.json starts with `//` comment lines and Copilot guards the list
+    with config.json.trusted-folders.lock, so the header is kept as it is and the lock is taken (flock; if Copilot locks it
+    another way ours is harmless) for up to 2 s. Returns the config file it changed, "" when already listed."""
+    path = copilot_config_file(a)
+    with open(f"{path}.trusted-folders.lock", "a") as lock:
+        for _ in range(20):
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError:
+                time.sleep(0.1)
+        else:
+            raise OSError("trusted-folders lock is busy")
         with open(path) as f:
-            cfg = json.load(f)
-        projects = cfg.get("projects")
-        if not isinstance(projects, dict) or (projects.get(key) or {}).get("hasTrustDialogAccepted"):
+            raw = f.read()
+        lines = raw.split("\n")
+        n = next((i for i, l in enumerate(lines) if not l.lstrip().startswith("//")), len(lines))
+        header, cfg = "\n".join(lines[:n]), json.loads("\n".join(lines[n:]))
+        folders = cfg.setdefault("trustedFolders", [])
+        if not isinstance(folders, list) or key in folders:
             return ""
-        entry = projects.setdefault(key, {})
-        if not isinstance(entry, dict):
-            return ""
-        for k, v in (("allowedTools", []), ("mcpContextUris", []), ("mcpServers", {}), ("enabledMcpjsonServers", []),
-                     ("disabledMcpjsonServers", []), ("hasClaudeMdExternalIncludesApproved", False),
-                     ("hasClaudeMdExternalIncludesWarningShown", False)):
-            entry.setdefault(k, v)
-        entry["hasTrustDialogAccepted"] = True
-        tmp = f"{path}.launcher-{os.getpid()}.tmp"
-        try:
-            with open(tmp, "w") as f:
-                f.write(json.dumps(cfg, indent=2, ensure_ascii=False))
-            os.chmod(tmp, os.stat(path).st_mode & 0o7777)
-            os.replace(tmp, path)
-        finally:
-            if os.path.exists(tmp):
-                os.remove(tmp)
+        folders.append(key)
+        text = (header + "\n" if header else "") + json.dumps(cfg, indent=2, ensure_ascii=False) + ("\n" if raw.endswith("\n") else "")
+        write_atomically(path, text)
+        return path
+
+
+TRUST_WRITERS = {"claude": trust_in_claude_config, "copilot": trust_in_copilot_config}
+
+
+def trust_folder(a, folder):
+    """Record "trust this folder" for a Claude or Copilot agent, so a fresh case folder starts the skill at once instead of
+    sitting at the agent's trust prompt (Claude's "Do you trust this folder?" / Copilot's "Confirm folder trust"; INC-9355,
+    2026-11-25: the window looked dead for 11 minutes and, with no transcript yet, no session list showed it). Only called
+    for the case folder the launcher itself just made under the workflow's own files root. OpenCode has no folder trust
+    (checked 2026-11-25: none in 1.19.5; its `external_directory` permission is already allowed by OPENCODE_PERMISSION).
+    Returns a note when it added the entry, "" when there was nothing to do.
+
+    Never raises and never creates a config file: if anything is off, the agent simply asks as before. Writes are atomic
+    and keep the file's mode and the agent's own formatting (byte-identical round-trip checked on the real files
+    2026-11-25). An agent that saves the same file in that millisecond could still win the race, which at worst costs one
+    trust entry or one counter."""
+    writer, key = TRUST_WRITERS.get(agent_kind(a)), os.path.realpath(folder)  # the agent asks about the real path
+    if not writer:
+        return ""
+    try:
+        changed = writer(a, key)
     except (OSError, ValueError) as e:
-        return f"could not pre-trust {short(key)} ({e.__class__.__name__}); Claude will ask"
-    return f"trusted {short(key)} in {short(path)}, so Claude does not ask"
+        return f"could not pre-trust {short(key)} ({e.__class__.__name__}); the agent will ask"
+    return f"trusted {short(key)} in {short(changed)}, so the agent does not ask" if changed else ""
 
 
 def worktree_argv(p, switch):

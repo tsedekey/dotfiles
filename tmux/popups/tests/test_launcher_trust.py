@@ -1,5 +1,6 @@
-"""Tests for trust_folder() in ~/dotfiles/tmux/popups/launcher.py: a fresh case folder is pre-trusted in the Claude agent's own
-config file, so the skill starts at once instead of waiting at "Do you trust this folder?" (INC-9355, 2026-11-25).
+"""Tests for trust_folder() in ~/dotfiles/tmux/popups/launcher.py: a fresh case folder is pre-trusted in the Claude or Copilot
+agent's own config file, so the skill starts at once instead of waiting at "Do you trust this folder?" / "Confirm folder
+trust" (INC-9355, 2026-11-25). OpenCode has no folder trust, so it is left alone.
 
 Run:  python3 -B -m unittest tests.test_launcher_trust -v     (from tmux/popups)
 Only throwaway config files are touched, never ~/.claude/.claude.json.
@@ -80,14 +81,14 @@ class TrustFolder(unittest.TestCase):
         self.assertEqual(e["allowedTools"], ["Bash(ls)"])
 
     def test_missing_config_is_not_created(self):
-        self.assertIn("Claude will ask", L.trust_folder(self.agent, self.folder))
+        self.assertIn("agent will ask", L.trust_folder(self.agent, self.folder))
         self.assertEqual(os.listdir(self.cfgdir), [])
 
     def test_unreadable_config_is_left_alone_with_a_note(self):
         with open(self.cfg, "w") as f:
             f.write("{ not json")
         note = L.trust_folder(self.agent, self.folder)
-        self.assertIn("Claude will ask", note)
+        self.assertIn("agent will ask", note)
         with open(self.cfg) as f:
             self.assertEqual(f.read(), "{ not json")
         self.assertEqual([n for n in os.listdir(self.cfgdir) if n.endswith(".tmp")], [])
@@ -97,15 +98,99 @@ class TrustFolder(unittest.TestCase):
         L.trust_folder(self.agent, self.folder)
         self.assertEqual(os.listdir(self.cfgdir), [".claude.json"])
 
-    def test_other_agents_are_skipped(self):
+    def test_opencode_and_unknown_agents_are_skipped(self):
         self.write({"projects": {}})
-        for a in ({"command": "copilot"}, {"type": "opencode", "command": "opencode"}):
+        for a in ({"type": "opencode", "command": "opencode"}, {"command": "/x/opencode-openrouter"}, {"command": "other"}):
             self.assertEqual(L.trust_folder(a, self.folder), "")
         self.assertEqual(self.read(), {"projects": {}})
 
     def test_config_file_follows_the_profile(self):
         self.assertEqual(L.claude_config_file(self.agent), self.cfg)
         self.assertEqual(L.claude_config_file({"command": "claude"}), os.path.join(L.HOME, ".claude.json"))
+
+
+HEADER = "// User settings belong in settings.json.\n// This file is managed automatically."
+
+
+class TrustFolderCopilot(unittest.TestCase):
+    """Copilot: `trustedFolders` in $COPILOT_HOME/config.json, which starts with // comment lines."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.home = os.path.join(self.tmp.name, "copilot")
+        os.makedirs(self.home)
+        self.cfg = os.path.join(self.home, "config.json")
+        self.folder = os.path.join(self.tmp.name, "cases", "INC-1")
+        os.makedirs(self.folder)
+        self.key = os.path.realpath(self.folder)
+        # the wrapper's file name is what makes agent_kind say "copilot"
+        self.agent = {"command": os.path.join(L.HOME, ".local/bin", L.COPILOT_WRAPPER), "env": {"COPILOT_HOME": self.home}}
+
+    def write(self, data, header=HEADER, newline=True, mode=0o600):
+        with open(self.cfg, "w") as f:
+            f.write((header + "\n" if header else "") + json.dumps(data, indent=2, ensure_ascii=False) + ("\n" if newline else ""))
+        os.chmod(self.cfg, mode)
+
+    def raw(self):
+        with open(self.cfg) as f:
+            return f.read()
+
+    def folders(self):
+        return json.loads("\n".join(l for l in self.raw().split("\n") if not l.startswith("//")))["trustedFolders"]
+
+    def test_appends_the_folder_and_changes_nothing_else(self):
+        self.write({"loggedInUsers": [{"login": "x"}], "trustedFolders": ["/a", "/b"], "recentModelIds": ["m"]})
+        before = self.raw()
+        self.assertIn("trusted", L.trust_folder(self.agent, self.folder))
+        self.assertEqual(self.folders(), ["/a", "/b", self.key])
+        self.assertEqual(self.raw(), before.replace('"/b"\n', '"/b",\n    "%s"\n' % self.key))  # one added line, nothing else
+
+    def test_keeps_the_comment_header_the_final_newline_and_the_mode(self):
+        self.write({"trustedFolders": []}, mode=0o600)
+        L.trust_folder(self.agent, self.folder)
+        raw = self.raw()
+        self.assertTrue(raw.startswith(HEADER + "\n{"))
+        self.assertTrue(raw.endswith("}\n"))
+        self.assertEqual(stat.S_IMODE(os.stat(self.cfg).st_mode), 0o600)
+        self.write({"trustedFolders": []}, newline=False)
+        L.trust_folder(self.agent, self.folder)
+        self.assertFalse(self.raw().endswith("\n"))
+
+    def test_works_without_a_header_and_creates_a_missing_list(self):
+        self.write({"other": 1}, header="")
+        L.trust_folder(self.agent, self.folder)
+        self.assertEqual(self.folders(), [self.key])
+        self.assertTrue(self.raw().startswith("{"))
+
+    def test_already_listed_is_untouched(self):
+        self.write({"trustedFolders": [self.key]})
+        before = os.stat(self.cfg).st_mtime_ns
+        self.assertEqual(L.trust_folder(self.agent, self.folder), "")
+        self.assertEqual(os.stat(self.cfg).st_mtime_ns, before)
+
+    def test_unreadable_or_missing_config_is_left_alone_with_a_note(self):
+        self.assertIn("agent will ask", L.trust_folder(self.agent, self.folder))  # missing
+        self.assertFalse(os.path.exists(self.cfg))
+        with open(self.cfg, "w") as f:
+            f.write(HEADER + "\n{ not json")
+        self.assertIn("agent will ask", L.trust_folder(self.agent, self.folder))
+        self.assertEqual(self.raw(), HEADER + "\n{ not json")
+        self.assertEqual([n for n in os.listdir(self.home) if n.endswith(".tmp")], [])
+
+    def test_a_held_lock_makes_it_give_up_and_leave_the_file_alone(self):
+        self.write({"trustedFolders": []})
+        before = self.raw()
+        import fcntl
+        with open(self.cfg + ".trusted-folders.lock", "a") as held:
+            fcntl.flock(held, fcntl.LOCK_EX)
+            note = L.trust_folder(self.agent, self.folder)
+        self.assertIn("agent will ask", note)
+        self.assertEqual(self.raw(), before)
+
+    def test_config_file_follows_copilot_home(self):
+        self.assertEqual(L.copilot_config_file(self.agent), self.cfg)
+        self.assertEqual(L.copilot_config_file({"command": "copilot"}), os.path.join(L.HOME, ".copilot", "config.json"))
 
 
 if __name__ == "__main__":
