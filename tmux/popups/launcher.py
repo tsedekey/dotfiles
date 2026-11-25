@@ -801,6 +801,53 @@ def agent_line(agents, agent, model, prompt="", extra=(), effort=""):
     return shlex.join((["env", *env] if env else []) + argv)
 
 
+def claude_config_file(a):
+    """The file Claude Code keeps its per-folder trust in: $CLAUDE_CONFIG_DIR/.claude.json, else ~/.claude.json."""
+    d = (a.get("env") or {}).get("CLAUDE_CONFIG_DIR")
+    return os.path.join(d, ".claude.json") if d else os.path.join(HOME, ".claude.json")
+
+
+def trust_folder(a, folder):
+    """Record "trust this folder" for a Claude agent, so a fresh case folder starts the skill at once instead of sitting at
+    Claude's "Do you trust this folder?" prompt (INC-9355, 2026-11-25: the window looked dead for 11 minutes, with no
+    transcript yet, so no session list showed it). Only called for the case folder the launcher itself just made under
+    the workflow's own files root. Returns a note when it added the entry, "" when there was nothing to do.
+
+    Never raises and never creates the config file: if anything is off, Claude simply asks as before. The write is atomic
+    (temp file + rename) and keeps the file's mode and Claude's own formatting (2-space JSON, no final newline), checked
+    byte-identical on the real files 2026-11-25. A Claude that saves the same file in that millisecond could still win
+    the race, which at worst costs one trust entry or one counter."""
+    if agent_kind(a) != "claude":
+        return ""
+    path, key = claude_config_file(a), os.path.realpath(folder)
+    try:
+        with open(path) as f:
+            cfg = json.load(f)
+        projects = cfg.get("projects")
+        if not isinstance(projects, dict) or (projects.get(key) or {}).get("hasTrustDialogAccepted"):
+            return ""
+        entry = projects.setdefault(key, {})
+        if not isinstance(entry, dict):
+            return ""
+        for k, v in (("allowedTools", []), ("mcpContextUris", []), ("mcpServers", {}), ("enabledMcpjsonServers", []),
+                     ("disabledMcpjsonServers", []), ("hasClaudeMdExternalIncludesApproved", False),
+                     ("hasClaudeMdExternalIncludesWarningShown", False)):
+            entry.setdefault(k, v)
+        entry["hasTrustDialogAccepted"] = True
+        tmp = f"{path}.launcher-{os.getpid()}.tmp"
+        try:
+            with open(tmp, "w") as f:
+                f.write(json.dumps(cfg, indent=2, ensure_ascii=False))
+            os.chmod(tmp, os.stat(path).st_mode & 0o7777)
+            os.replace(tmp, path)
+        finally:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+    except (OSError, ValueError) as e:
+        return f"could not pre-trust {short(key)} ({e.__class__.__name__}); Claude will ask"
+    return f"trusted {short(key)} in {short(path)}, so Claude does not ask"
+
+
 def worktree_argv(p, switch):
     if p.get("open_handle"):
         # The worktree of this branch exists and has no window (closed with prefix + F, or a restart). `workmux add` has no way
@@ -1077,6 +1124,10 @@ def start_window(p, agents, dry, switch, show=True):
             else:
                 print(f"  note: could not find the right-hand pane; it stays in the worktree (files: {p['case_dir']})")
         return
+    if p["case_dir"] and os.path.realpath(cwd) == os.path.realpath(p["case_dir"]):  # the agent starts in the folder we made
+        note = trust_folder(agents[p["agent"]], p["case_dir"])
+        if note:
+            print(f"  note: {note}")
     line = agent_line(agents, p["agent"], p["model"], p["prompt"], p["extra"], p["effort"])
     win, pane = tmux("new-window", "-P", "-F", "#{window_id} #{pane_id}",
                      "-t", f"={s}:", "-n", p["window"], "-c", cwd).split()
