@@ -16,7 +16,11 @@
 #           default model) and Tab lists every model the chosen agent offers. Not asked for a worktree window.
 #   effort  reasoning effort for the session: low | medium | high | xhigh | max (Copilot also none | minimal).
 #           Passed as `--effort <level>` to Claude and `--reasoning-effort <level>` to Copilot; empty = the
-#           harness' own `effortLevel` setting (both are "high" today). Which levels work depends on the
+#           harness' own `effortLevel` setting ("high" for work Claude and Copilot; the personal profile sets xhigh
+#           for Sonnet 5.5). Decided 2026-11-26: xhigh for the judgment-heavy workflows (change, epic, review,
+#           investigate, assess); the pickers, triage, babysit, medic, daily and backport stay on the harness default
+#           (high). xhigh costs more tokens (Copilot: more AI credits), not only time. A level the model does not
+#           support silently falls back to the highest it does. Which levels work depends on the
 #           model. OpenCode has no such flag and a worktree has no way to pass one (workmux add), so there
 #           the default is ignored with a note. Tab flow: asked right after the model. CLI: --effort.
 #   skill   started as the agent's first prompt: `/<skill> <case>`. Must be installed for that agent
@@ -118,7 +122,7 @@ workflows:
   change:                              # plan stage: Copilot in the main checkout, no worktree
     agent: copilot-long                # copilot + the extended 1M context tier (see the agent in config.yaml)
     model: claude-sonnet-5.5
-    effort: xhigh                      # planning is where depth pays off; the other workflows keep the harness default for now
+    effort: xhigh                      # planning is where depth pays off
     skill: change-companion
     repo: ~/dev/camunda/camunda        # worktree off it is optional (Tab flow)
     files: ~/.local/share/camunda/change-companion    # <issue number>/
@@ -147,6 +151,7 @@ workflows:
   epic:                                # Claude, not Copilot: epic-companion needs Slack and Glean
     agent: claude
     model: claude-sonnet-5-5           # Claude ids are hyphenated (Copilot's are claude-sonnet-5.5)
+    effort: xhigh
     skill: epic-companion
     workspaces: ~/.local/share/camunda/epic-companion    # one folder per epic, e.g. product-hub-3517-variable-trace/
     key: github-issue                  # the TASK issue; its default repo is the epic's `issues:` in <epic>/epic.yaml
@@ -156,6 +161,7 @@ workflows:
   review:                              # reads the PR; no code to change, so it starts in its case folder
     agent: copilot-long                # copilot + the extended 1M context tier (see the agent in config.yaml)
     model: claude-sonnet-5.5
+    effort: xhigh
     skill: review-companion
     files: ~/.local/share/camunda/review-companion/cases    # <PR number>/ (other repos: dmn-scala-391/)
     key: github-pr:camunda/camunda
@@ -203,6 +209,7 @@ workflows:
 
   investigate:
     agent: claude
+    effort: xhigh
     skill: investigate-companion
     files: ~/.local/share/camunda/investigate-companion/cases    # <INC-nnnn>/
     key: incident
@@ -210,12 +217,13 @@ workflows:
     ask: [case]
     extra_dirs: [~/dev/camunda/camunda]
 
-  assess:
+  assess:                              # keyed by the incident, not the CVE (Eddie, 2026-11-26): the incident pins the case to one finding, also for an internal CVE
     agent: claude
+    effort: xhigh
     skill: assess-companion
-    files: ~/.local/share/camunda/assess-companion/cases    # <CVE-ID>/
-    key: cve
-    case_label: CVE ID
+    files: ~/.local/share/camunda/assess-companion/cases    # <INC-nnnn>/ (cases opened before 2026-11-26 are <CVE-ID>/ and stay where they are)
+    key: incident
+    case_label: incident.io ref
     ask: [case]
 
   medic:                               # one folder per shift, named by its start date
